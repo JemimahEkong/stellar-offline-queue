@@ -1,0 +1,1 @@
+# Gated testnet integration tests arrive with Issue #19 (Phase 18). Run via: npm run test:integration
