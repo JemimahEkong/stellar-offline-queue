@@ -22,7 +22,7 @@ export {
   AMOUNT_MAX_DECIMAL_PLACES,
   AMOUNT_MAX_INT64,
 } from './intent.js';
-export { ValidationError, StellarOfflineQueueError } from './errors.js';
+export { ValidationError, StellarOfflineQueueError, InvalidTransitionError } from './errors.js';
 export type {
   Intent,
   CreateIntentInput,
@@ -35,3 +35,37 @@ export type {
   ThresholdConfig,
 } from './intent.js';
 export type { ValidationErrorCode } from './errors.js';
+
+// Phase 2: State machine
+export {
+  ALL_STATUSES,
+  TERMINAL_STATES,
+  PERSISTED_STATES,
+  TRANSIENT_STATES,
+  PRE_SUBMISSION_STATES,
+  IN_FLIGHT_STATES,
+  RETRYABLE_STATES,
+  TRANSITIONS,
+  canTransition,
+  validateTransition,
+  isInFlight,
+  isTerminal,
+  isPreSubmission,
+  isReclaimable,
+} from './state.js';
+export type { IntentStatus, TransitionTrigger, TransitionRule, TransitionResult, MinimalEntry } from './state.js';
+
+// Phase 3: Storage abstraction
+export type {
+  QueueStore,
+  QueueEntry,
+  AttemptRecord,
+  CASResult,
+  CASOkResult,
+  CASFailResult,
+} from './store/types.js';
+export {
+  PayloadMismatchError,
+  EntryNotFoundError,
+  StoreError,
+} from './errors.js';

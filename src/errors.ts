@@ -72,3 +72,65 @@ export class ValidationError extends StellarOfflineQueueError {
     this.field = field;
   }
 }
+
+/**
+ * Thrown by `validateTransition` when a state transition is not in the
+ * transition table, the trigger mismatches, or the from/to combination is
+ * otherwise illegal (architecture §6.3–6.4).
+ */
+export class InvalidTransitionError extends StellarOfflineQueueError {
+  readonly from: string;
+  readonly to: string;
+  readonly trigger?: string;
+
+  constructor(from: string, to: string, reason: string, trigger?: string) {
+    super('invalid-transition', reason);
+    this.name = 'InvalidTransitionError';
+    this.from = from;
+    this.to = to;
+    this.trigger = trigger;
+  }
+}
+
+/**
+ * Thrown when the engine detects a payload integrity violation: the stored
+ * `payloadHash` does not match the recomputed hash of the intent payload.
+ * The entry is transitioned to FAILED and must not be rebuilt (§9.4).
+ */
+export class PayloadMismatchError extends StellarOfflineQueueError {
+  readonly intentId: string;
+
+  constructor(intentId: string) {
+    super('payload-mismatch', `intent "${intentId}" payloadHash does not match payload`);
+    this.name = 'PayloadMismatchError';
+    this.intentId = intentId;
+  }
+}
+
+/**
+ * Thrown when a non-CAS method references an entry that does not exist in
+ * the store.
+ */
+export class EntryNotFoundError extends StellarOfflineQueueError {
+  readonly intentId: string;
+
+  constructor(intentId: string) {
+    super('entry-not-found', `entry "${intentId}" not found in store`);
+    this.name = 'EntryNotFoundError';
+    this.intentId = intentId;
+  }
+}
+
+/**
+ * Thrown when a store adapter encounters an internal error (disk full,
+ * corruption, connection lost). The `cause` preserves the underlying error.
+ */
+export class StoreError extends StellarOfflineQueueError {
+  constructor(message: string, cause?: Error) {
+    super('storage-error', message);
+    this.name = 'StoreError';
+    if (cause !== undefined) {
+      this.cause = cause;
+    }
+  }
+}
