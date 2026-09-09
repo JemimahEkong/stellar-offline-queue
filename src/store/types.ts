@@ -1,2 +1,190 @@
-// QueueStore CAS interface and result types (Phase 3, architecture §9.2).
-export {};
+/**
+ * QueueStore CAS interface and result types (Phase 3 / Issue #4, architecture §9.2).
+ *
+ * This module defines the storage contract: the `QueueStore` interface with
+ * compare-and-set primitives that make "no double submission" structural.
+ * The interface is frozen before adapters are written; every adapter passes
+ * the same contract test suite (tests/store/contract.ts).
+ *
+ * Model contract: ADR-0003, architecture §5.3, §9.2, ADR-0007 (claim/lease),
+ * ADR-0011 (remove restrictions).
+ */
+
+import type { IntentStatus } from '../state.js';
+import type { Intent } from '../intent.js';
+
+// ---------------------------------------------------------------------------
+// Queue entry (architecture §5.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The mutable record wrapping an immutable intent. This is what the store
+ * persists; every field except `intent` mutates over the entry's lifecycle.
+ */
+export type QueueEntry = {
+  /** The immutable, hash-protected intent (ADR-0001). */
+  intent: Intent;
+
+  /** Current lifecycle state (§6.2). */
+  status: IntentStatus;
+
+  /** Number of build cycles started (each write-ahead transition increments). */
+  attemptCount: number;
+
+  /** Snapshot of config.maxAttempts at enqueue time. */
+  maxAttempts: number;
+
+  /** Next eligible processing time (ms epoch); 0 = due immediately. */
+  nextAttemptAt: number;
+
+  /** Consecutive transient failures driving backoff (resets on progress). */
+  backoffAttempts: number;
+
+  /** Worker id holding the claim lease (§6.7); undefined when unclaimed. */
+  claimedBy?: string;
+
+  /** Lease expiry (ms epoch); 0 = unclaimed. */
+  claimExpiresAt: number;
+
+  /** Last error, if any (code + message + timestamp). */
+  lastError?: { code: string; message: string; ts: number };
+
+  /** Envelope hashes possibly sent to the network — write-ahead journal. */
+  inFlightHashes: string[];
+
+  /** Audit log of attempt records (one per build cycle). */
+  attempts: AttemptRecord[];
+
+  /** Last update timestamp (ms epoch). */
+  updatedAt: number;
+
+  /** Optimistic concurrency token; incremented on every successful mutation. */
+  version: number;
+};
+
+// ---------------------------------------------------------------------------
+// Attempt record (architecture §5.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Audit record for one build cycle (one envelope). Created at the write-ahead
+ * transition; one AttemptRecord per envelope submitted.
+ */
+export type AttemptRecord = {
+  /** Envelope hash (hex) — dedupe key, journaled before submit. */
+  envelopeHash: string;
+
+  /** Sequence number used in this envelope (audit only, never authoritative). */
+  sequenceNumber: number;
+
+  /** When the envelope was submitted (ms epoch). */
+  submittedAt: number;
+
+  /** Outcome of this attempt (updated by reconciliation). */
+  outcome: 'UNKNOWN' | 'SUCCESS' | 'FAILED' | 'EXPIRED' | 'INDETERMINATE';
+
+  /** Result XDR (on FAILED, for application diagnosis). */
+  resultXdr?: string;
+
+  /**
+   * Flush-time parameters used to build this envelope (needed for deterministic
+   * identical rebuild across restarts — Phase 8 / ADR-0008).
+   */
+  maxTime: number;
+
+  /** Base fee used when building this envelope (string to avoid float precision). */
+  fee: string;
+};
+
+// ---------------------------------------------------------------------------
+// CAS result types
+// ---------------------------------------------------------------------------
+
+/** Result of a successful CAS operation. */
+export type CASOkResult = { ok: true; entry: QueueEntry };
+
+/** Result of a failed CAS operation. */
+export type CASFailResult = {
+  ok: false;
+  reason: 'state' | 'version' | 'missing' | 'not-due';
+};
+
+/** Union of CAS operation results. */
+export type CASResult = CASOkResult | CASFailResult;
+
+// ---------------------------------------------------------------------------
+// QueueStore interface (architecture §9.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The storage contract for the durable queue. Every method is idempotency-
+ * aware by construction. CAS methods (`claim`, `transition`, `remove`) fail
+ * with typed reasons rather than corrupting state.
+ *
+ * - `version` is an optimistic-concurrency token incremented on every
+ *   successful mutation.
+ * - `insert` with a duplicate id returns the existing entry (never corrupts).
+ * - `claim` grants the processing lease (§6.7).
+ * - `transition` atomically applies field updates with the state change.
+ * - `listDue` / `listByState` support the scheduler and recovery sweep.
+ * - `remove` is CAS-restricted to pre-submission states (ADR-0011).
+ */
+export interface QueueStore {
+  /**
+   * Insert a new entry. Duplicate `id` returns the existing entry without
+   * mutating it (idempotent insert).
+   */
+  insert(entry: QueueEntry): Promise<QueueEntry>;
+
+  /** Get an entry by id; returns undefined if not found. */
+  get(id: string): Promise<QueueEntry | undefined>;
+
+  /**
+   * CAS claim: succeeds only if `status ∈ fromStates` AND `nextAttemptAt ≤ now`
+   * AND `version` matches. On success, atomically sets `status = READY`,
+   * `claimedBy = workerId`, `claimExpiresAt = now + leaseMs`, and increments
+   * version.
+   */
+  claim(
+    id: string,
+    fromStates: IntentStatus[],
+    now: number,
+    expectedVersion: number,
+    workerId: string,
+    leaseMs: number,
+  ): Promise<CASResult>;
+
+  /**
+   * CAS transition: `fromStates` must include current status and `version` must
+   * match. Atomically applies `update` (shallow merge; arrays replaced
+   * wholesale), sets `updatedAt`, and increments version.
+   */
+  transition(
+    id: string,
+    fromStates: IntentStatus[],
+    to: IntentStatus,
+    update: Partial<QueueEntry>,
+    expectedVersion: number,
+    now: number,
+  ): Promise<CASResult>;
+
+  /**
+   * Scheduler scan: entries in `fromStates` with `nextAttemptAt ≤ dueBefore`,
+   * ordered by `createdAt` then `id` (deterministic).
+   */
+  listDue(fromStates: IntentStatus[], dueBefore: number): Promise<QueueEntry[]>;
+
+  /** Recovery sweep: all entries in any of the given states. */
+  listByState(states: IntentStatus[]): Promise<QueueEntry[]>;
+
+  /** Generic list with optional filters. */
+  list(opts?: { status?: IntentStatus; account?: string; limit?: number }): Promise<QueueEntry[]>;
+
+  /**
+   * CAS remove: deletes an entry, but only if its status is in `fromStates`
+   * and `version` matches. Pre-submission only per ADR-0011.
+   *
+   * @returns `true` if deleted, `false` if CAS failed (state, version, or missing).
+   */
+  remove(id: string, fromStates: IntentStatus[], expectedVersion: number): Promise<boolean>;
+}
