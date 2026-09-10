@@ -69,3 +69,11 @@ export {
   EntryNotFoundError,
   StoreError,
 } from './errors.js';
+
+// Phase 4: MemoryStore
+export { MemoryStore } from './store/memory.js';
+export type { MemoryStoreOptions } from './store/memory.js';
+
+// Phase 5: SqliteStore
+export { SqliteStore } from './store/sqlite.js';
+export type { SqliteStoreOptions } from './store/sqlite.js';
