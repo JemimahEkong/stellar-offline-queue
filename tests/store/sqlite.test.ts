@@ -14,6 +14,8 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { SqliteStore } from '../../src/store/sqlite.js';
 import { runStoreContractTests } from './contract.js';
+import { claimEntry, reclaimExpired, refreshLease } from '../../src/ownership.js';
+import { OwnershipLostError } from '../../src/errors.js';
 import type { QueueEntry } from '../../src/store/types.js';
 import type { CreateIntentInput } from '../../src/intent.js';
 import { createIntent } from '../../src/intent.js';
@@ -259,6 +261,126 @@ describe('SqliteStore', () => {
       const timeout = store.getDb().pragma('busy_timeout', { simple: true });
       expect(timeout).toBe(3000);
       await store.close();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Ownership on multi-connection SQLite (Phase 6 / Issue #7)
+  // -----------------------------------------------------------------------
+
+  describe('ownership: multi-connection', () => {
+    it('two workers claim the same id across connections: exactly one wins', async () => {
+      const path = tempPath();
+      const entry = makeEntry('QUEUED');
+      const seed = new SqliteStore(path);
+      await seed.insert(entry);
+
+      const connA = new SqliteStore(path);
+      const connB = new SqliteStore(path);
+
+      const a = await claimEntry(connA, entry.intent.id, {
+        workerId: 'worker-a',
+        leaseMs: 60_000,
+        now: 0,
+      });
+      const b = await claimEntry(connB, entry.intent.id, {
+        workerId: 'worker-b',
+        leaseMs: 60_000,
+        now: 0,
+      });
+
+      expect(a.ok).toBe(true);
+      expect(b.ok).toBe(false);
+      if (!b.ok) expect(b.reason).toBe('state');
+
+      // The winner's lease is visible from the other connection.
+      const fromB = await connB.get(entry.intent.id);
+      expect(fromB!.status).toBe('READY');
+      expect(fromB!.claimedBy).toBe('worker-a');
+      expect(fromB!.claimExpiresAt).toBe(60_000);
+
+      await connA.close();
+      await connB.close();
+      await seed.close();
+    });
+
+    it('janitor race across connections: exactly one reclaim wins (20 iterations)', async () => {
+      const path = tempPath();
+      const seed = new SqliteStore(path);
+
+      for (let i = 0; i < 20; i++) {
+        const entry = makeEntry('QUEUED');
+        await seed.insert(entry);
+
+        const claimed = await claimEntry(seed, entry.intent.id, {
+          workerId: 'worker-a',
+          leaseMs: 60_000,
+          now: 0,
+        });
+        expect(claimed.ok).toBe(true);
+
+        const janitorA = new SqliteStore(path);
+        const janitorB = new SqliteStore(path);
+        const [idsA, idsB] = await Promise.all([
+          reclaimExpired(janitorA, 60_001),
+          reclaimExpired(janitorB, 60_001),
+        ]);
+
+        const winners = [...idsA, ...idsB].filter((id) => id === entry.intent.id);
+        expect(winners).toHaveLength(1);
+
+        const after = await seed.get(entry.intent.id);
+        expect(after!.status).toBe('QUEUED');
+        expect(after!.claimedBy).toBeUndefined();
+
+        await janitorA.close();
+        await janitorB.close();
+      }
+
+      await seed.close();
+    }, 120_000);
+
+    it('stale worker loses across connections: refreshLease throws OwnershipLostError after takeover', async () => {
+      const path = tempPath();
+      const entry = makeEntry('QUEUED');
+      const connA = new SqliteStore(path);
+      await connA.insert(entry);
+
+      const claimed = await claimEntry(connA, entry.intent.id, {
+        workerId: 'worker-a',
+        leaseMs: 60_000,
+        now: 0,
+      });
+      expect(claimed.ok).toBe(true);
+
+      // Worker B takes over on another connection after the lease expires.
+      await reclaimExpired(connA, 60_001);
+      const connB = new SqliteStore(path);
+      const taken = await claimEntry(connB, entry.intent.id, {
+        workerId: 'worker-b',
+        leaseMs: 60_000,
+        now: 60_001,
+      });
+      expect(taken.ok).toBe(true);
+
+      // The stale worker's refresh fails on its own connection.
+      await expect(
+        refreshLease(connA, entry.intent.id, 'worker-a', 60_000, 60_002),
+      ).rejects.toThrow(OwnershipLostError);
+
+      // And its raw CAS transition fails too — no mutation path is open.
+      const stale = await connA.transition(
+        entry.intent.id,
+        ['READY'],
+        'BUILDING',
+        {},
+        claimed.ok ? claimed.entry.version : 0,
+        60_002,
+      );
+      expect(stale.ok).toBe(false);
+
+      await connA.close();
+      await connB.close();
     });
   });
 

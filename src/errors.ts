@@ -108,6 +108,24 @@ export class PayloadMismatchError extends StellarOfflineQueueError {
 }
 
 /**
+ * Thrown when a worker attempts to act on an entry it no longer owns:
+ * its lease expired (and the janitor reclaimed the entry), or another worker
+ * won a CAS conflict. The engine's abort rule (ADR-0007, invariant §6.5.5)
+ * turns this into "abort without submitting" — it must never be raced.
+ */
+export class OwnershipLostError extends StellarOfflineQueueError {
+  readonly intentId: string;
+  readonly workerId: string;
+
+  constructor(intentId: string, workerId: string, reason: string) {
+    super('ownership-lost', `worker "${workerId}" lost ownership of entry "${intentId}": ${reason}`);
+    this.name = 'OwnershipLostError';
+    this.intentId = intentId;
+    this.workerId = workerId;
+  }
+}
+
+/**
  * Thrown when a non-CAS method references an entry that does not exist in
  * the store.
  */

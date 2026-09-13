@@ -98,6 +98,22 @@ export function makeQueueEntry(
   };
 }
 
+/**
+ * A claimed entry: status READY under a live lease held by `workerId`.
+ * Applies the claim fields the store's CAS claim would set, so ownership
+ * tests can start from a claimed state without going through a claim call.
+ */
+export function makeClaimedEntry(
+  overrides: Partial<QueueEntry> & { claimedBy?: string | undefined } = {},
+): QueueEntry {
+  const { claimedBy = 'worker-a', ...rest } = overrides;
+  return makeQueueEntry('READY', {
+    claimedBy,
+    claimExpiresAt: TEST_NOW + TEST_LEASE_MS,
+    ...rest,
+  });
+}
+
 /** A valid issued-asset config (USDC on the fixed issuer). */
 export function issuedAsset(overrides: { code?: string; issuer?: string } = {}) {
   return { code: overrides.code ?? 'USDC', issuer: overrides.issuer ?? otherAccountId };

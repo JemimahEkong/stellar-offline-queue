@@ -68,3 +68,14 @@ export { PayloadMismatchError, EntryNotFoundError, StoreError } from './errors.j
 // Phase 4: Memory adapter (reference store; non-durable per architecture §15.5)
 export { MemoryStore } from './store/memory.js';
 export type { MemoryStoreOptions } from './store/memory.js';
+
+// Phase 6: Processing ownership (claims, leases, janitor; ADR-0007)
+export {
+  createWorkerId,
+  claimEntry,
+  refreshLease,
+  reclaimExpired,
+  withOwnership,
+} from './ownership.js';
+export type { ClaimParams, ClaimResult } from './ownership.js';
+export { OwnershipLostError } from './errors.js';
