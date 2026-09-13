@@ -55,9 +55,10 @@ export const ALL_STATUSES: readonly IntentStatus[] = [
 // ---------------------------------------------------------------------------
 
 /**
- * Terminal states: no further transitions allowed (except documented manual
- * retry from FAILED / EXPIRED, which is handled by the retry API, not the
- * transition table).
+ * Terminal states: no outgoing transitions except the documented manual-retry
+ * escape rows (§6.3): `FAILED → QUEUED` and attempts-exhausted
+ * `EXPIRED → QUEUED`, both via the app-driven `retry(id)` API (ADR-0008).
+ * `SUCCESS` and `INDETERMINATE` have no outgoing transitions at all.
  */
 export const TERMINAL_STATES: readonly IntentStatus[] = [
   'SUCCESS',
@@ -106,10 +107,7 @@ export const PRE_SUBMISSION_STATES: readonly IntentStatus[] = [
  * In-flight states: an envelope may have been submitted. The engine must
  * reconcile journaled hashes before taking any further action.
  */
-export const IN_FLIGHT_STATES: readonly IntentStatus[] = [
-  'SUBMITTING',
-  'CONFIRMING',
-] as const;
+export const IN_FLIGHT_STATES: readonly IntentStatus[] = ['SUBMITTING', 'CONFIRMING'] as const;
 
 /**
  * Retryable states (ADR-0008): states from which an automatic or manual
@@ -185,12 +183,10 @@ export const TRANSITIONS: Readonly<
 
   BUILDING: {
     SIGNING: { trigger: 'draft-built' },
-    FAILED: { trigger: 'deterministic-failure' },
   },
 
   SIGNING: {
     SUBMITTING: { trigger: 'write-ahead', requiresReason: true },
-    FAILED: { trigger: ['deterministic-failure', 'submit-error-provable'] },
   },
 
   SUBMITTING: {
@@ -212,11 +208,17 @@ export const TRANSITIONS: Readonly<
   },
 
   EXPIRED: {
-    QUEUED: { trigger: 'rebuild', attemptsIncrement: true },
+    // Automatic rebuild (attempts remain) and manual retry of an
+    // attempts-exhausted entry — §6.3 rows 18 and 20 (ADR-0008).
+    QUEUED: { trigger: ['rebuild', 'manual-retry'], attemptsIncrement: true },
+  },
+
+  FAILED: {
+    // Manual retry escape hatch — §6.3 row 19 (ADR-0008, ADR-0011 companion).
+    QUEUED: { trigger: 'manual-retry' },
   },
 
   SUCCESS: {},
-  FAILED: {},
   INDETERMINATE: {},
 } as const;
 
@@ -224,9 +226,7 @@ export const TRANSITIONS: Readonly<
 // Pure transition validation
 // ---------------------------------------------------------------------------
 
-export type TransitionResult =
-  | { ok: true }
-  | { ok: false; reason: string };
+export type TransitionResult = { ok: true } | { ok: false; reason: string };
 
 /**
  * Check whether a transition is valid according to the transition table.
@@ -256,9 +256,7 @@ export function canTransition(
   }
 
   if (trigger !== undefined) {
-    const allowedTriggers = Array.isArray(rule.trigger)
-      ? rule.trigger
-      : [rule.trigger];
+    const allowedTriggers = Array.isArray(rule.trigger) ? rule.trigger : [rule.trigger];
     if (!allowedTriggers.includes(trigger)) {
       return {
         ok: false,

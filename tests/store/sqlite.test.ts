@@ -83,7 +83,21 @@ describe('SqliteStore', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  runStoreContractTests('SqliteStore', () => Promise.resolve(new SqliteStore(tempPath())));
+  // `durable: true` + `reopen` activates the shared contract suite's
+  // restart-durability variant: the reopen factory opens the SAME database
+  // file, simulating a process restart against persisted storage.
+  let currentPath = '';
+  runStoreContractTests(
+    'SqliteStore',
+    () => {
+      currentPath = tempPath();
+      return Promise.resolve(new SqliteStore(currentPath));
+    },
+    {
+      durable: true,
+      reopen: () => Promise.resolve(new SqliteStore(currentPath)),
+    },
+  );
 
   // -----------------------------------------------------------------------
   // Restart durability

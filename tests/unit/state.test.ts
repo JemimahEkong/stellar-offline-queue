@@ -4,11 +4,13 @@
  * Coverage per implementation plan §Phase 2 Tests:
  * - Every valid transition: iterate TRANSITIONS, assert canTransition ok for
  *   each row with its trigger.
- * - Every invalid transition: iterate the full 11×11 cross product; assert
+ * - Every invalid transition: iterate the full 12×12 cross product; assert
  *   every pair not in the table is rejected. Snapshot the accepted pair count.
  * - Trigger mismatch: a valid pair with wrong trigger is rejected.
- * - Recovery transitions present: READY→QUEUED, EXPIRED→QUEUED, FAILED→QUEUED.
- * - Terminal classification: SUCCESS, FAILED, INDETERMINATE are terminal.
+ * - Recovery transitions present: READY→QUEUED, EXPIRED→QUEUED, FAILED→QUEUED
+ *   (manual-retry escape rows, §6.3 rows 18–20).
+ * - Terminal classification: SUCCESS, FAILED, INDETERMINATE are terminal
+ *   (FAILED/EXPIRED keep only the documented manual-retry escape).
  * - Predicates: isInFlight, isPreSubmission, isReclaimable truth tables.
  * - InvalidTransitionError thrown by validateTransition.
  */
@@ -129,9 +131,12 @@ describe('every valid transition', () => {
   const pairs = validPairs();
 
   it('snapshot: total valid transition count', () => {
+    // §6.3 rows 1–17 (ordinary transitions) + rows 18–20 (EXPIRED→QUEUED,
+    // FAILED→QUEUED manual-retry escapes). Row 17 (`SUBMITTING`/`CONFIRMING`
+    // → recovery sweep) is a recovery procedure, not a table row.
     // This snapshot guards against accidental additions.
     // If you intentionally add a transition, update this count.
-    expect(countTransitions()).toBe(19);
+    expect(countTransitions()).toBe(18);
   });
 
   for (const [from, to] of pairs) {
@@ -149,7 +154,7 @@ describe('every valid transition', () => {
 // ---------------------------------------------------------------------------
 
 describe('every invalid transition', () => {
-  it('full 11×11 cross product: every non-table pair is rejected', () => {
+  it('full 12×12 cross product: every non-table pair is rejected', () => {
     let acceptedCount = 0;
 
     for (const from of ALL_STATUSES) {
@@ -206,10 +211,25 @@ describe('recovery transitions', () => {
     expect(canTransition('EXPIRED', 'QUEUED', 'rebuild')).toEqual({ ok: true });
   });
 
-  it('FAILED → QUEUED is not in the transition table (handled by retry() API)', () => {
-    // Manual retry from FAILED is handled by queue.retry(), which performs a
-    // separate CAS operation. It is NOT a row in the §6.3 transition table.
-    expect(canTransition('FAILED', 'QUEUED').ok).toBe(false);
+  it('FAILED → QUEUED via manual-retry (§6.3 row 19, ADR-0008)', () => {
+    expect(canTransition('FAILED', 'QUEUED', 'manual-retry')).toEqual({ ok: true });
+  });
+
+  it('FAILED → QUEUED with any other trigger is rejected', () => {
+    expect(canTransition('FAILED', 'QUEUED', 'janitor-reclaim').ok).toBe(false);
+    expect(canTransition('FAILED', 'QUEUED', 'rebuild').ok).toBe(false);
+    expect(canTransition('FAILED', 'QUEUED', 'verdict-failed').ok).toBe(false);
+  });
+
+  it('EXPIRED → QUEUED via manual-retry (attempts-exhausted escape, §6.3 row 20)', () => {
+    expect(canTransition('EXPIRED', 'QUEUED', 'manual-retry')).toEqual({ ok: true });
+  });
+
+  it('FAILED → anything-but-QUEUED is rejected', () => {
+    for (const to of ALL_STATUSES) {
+      if (to === 'QUEUED') continue;
+      expect(canTransition('FAILED', to).ok).toBe(false);
+    }
   });
 });
 
@@ -224,12 +244,16 @@ describe('terminal states', () => {
     expect(canTransition('SUCCESS', 'FAILED').ok).toBe(false);
   });
 
-  it('FAILED has no outgoing transitions in the table', () => {
-    // FAILED → QUEUED is NOT in the transition table; manual retry is
-    // handled by queue.retry() as a separate CAS operation.
-    expect(canTransition('FAILED', 'QUEUED').ok).toBe(false);
+  it('FAILED has only the manual-retry escape row', () => {
+    // §6.3 row 19: FAILED → QUEUED via explicit retry(id) (ADR-0008).
+    expect(canTransition('FAILED', 'QUEUED', 'manual-retry').ok).toBe(true);
     expect(canTransition('FAILED', 'READY').ok).toBe(false);
     expect(canTransition('FAILED', 'SUCCESS').ok).toBe(false);
+    expect(canTransition('FAILED', 'SUBMITTING').ok).toBe(false);
+  });
+
+  it('FAILED → QUEUED with wrong trigger is rejected', () => {
+    expect(canTransition('FAILED', 'QUEUED', 'claim').ok).toBe(false);
   });
 
   it('INDETERMINATE has no outgoing transitions', () => {

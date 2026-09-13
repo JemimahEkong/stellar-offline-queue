@@ -8,7 +8,7 @@ Offline-first transaction workflow and reliability layer for Stellar application
 
 - Architecture, V1 scope, and decision records: see [`docs/architecture.md`](docs/architecture.md), [`docs/v1-scope.md`](docs/v1-scope.md), and [`docs/decisions/`](docs/decisions/).
 - Execution plan: [`docs/implementation.md`](docs/implementation.md) (24 phases, 0–23) with the issue breakdown in [`docs/github-issues.md`](docs/github-issues.md).
-- This repository currently contains the approved documentation set, the repository foundation (toolchain, CI, source/test structure), and the core domain model (`src/intent.ts`: intent types, validation, canonical payload hash, `createPaymentIntent` factory — Issue #2 / Phase 1). All other `src/` modules are stubs pending their implementation issues.
+- This repository currently contains the approved documentation set, the repository foundation (toolchain, CI, source/test structure), the core domain model (`src/intent.ts` — Issue #2), the lifecycle state machine (`src/state.ts` — Issue #3), the storage contract (`src/store/types.ts` + the shared adapter contract suite — Issue #4), and the reference adapter `MemoryStore` (`src/store/memory.ts` — Issue #5). `MemoryStore` is a deterministic, in-process adapter for tests and local development and is **non-durable by design**: all state is discarded on `close()`; use `SqliteStore` (Issue #6, pending) wherever entries must survive a restart. Remaining `src/` modules are stubs pending their implementation issues.
 
 ## Planned V1 capabilities (design approved; not yet implemented)
 

@@ -157,6 +157,7 @@ export type SqliteStoreOptions = {
  */
 export class SqliteStore implements QueueStore {
   private db: Database.Database;
+  private open = true;
 
   constructor(path: string, opts?: SqliteStoreOptions) {
     const wal = opts?.wal ?? true;
@@ -243,16 +244,14 @@ export class SqliteStore implements QueueStore {
     );
     // Return existing on duplicate (idempotent insert).
     const existing = this.db.prepare('SELECT * FROM queue_entries WHERE id = ?').get(row.id) as
-      | Row
-      | undefined;
+      Row | undefined;
     return rowToEntry(existing!);
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
   async get(id: string): Promise<QueueEntry | undefined> {
     const row = this.db.prepare('SELECT * FROM queue_entries WHERE id = ?').get(id) as
-      | Row
-      | undefined;
+      Row | undefined;
     return row !== undefined ? rowToEntry(row) : undefined;
   }
 
@@ -270,8 +269,7 @@ export class SqliteStore implements QueueStore {
   > {
     const txResult = this.db.transaction(() => {
       const row = this.db.prepare('SELECT * FROM queue_entries WHERE id = ?').get(id) as
-        | Row
-        | undefined;
+        Row | undefined;
       if (row === undefined) return { ok: false, reason: 'missing' as const };
       if (!fromStates.includes(row.status as IntentStatus))
         return { ok: false, reason: 'state' as const };
@@ -307,13 +305,11 @@ export class SqliteStore implements QueueStore {
     expectedVersion: number,
     now: number,
   ): Promise<
-    | { ok: true; entry: QueueEntry }
-    | { ok: false; reason: 'state' | 'version' | 'missing' }
+    { ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'version' | 'missing' }
   > {
     const txResult = this.db.transaction(() => {
       const row = this.db.prepare('SELECT * FROM queue_entries WHERE id = ?').get(id) as
-        | Row
-        | undefined;
+        Row | undefined;
       if (row === undefined) return { ok: false, reason: 'missing' as const };
       if (!fromStates.includes(row.status as IntentStatus))
         return { ok: false, reason: 'state' as const };
@@ -364,8 +360,7 @@ export class SqliteStore implements QueueStore {
       return { ok: true as const, entry: rowToEntry(updated) };
     })();
     return txResult as
-      | { ok: true; entry: QueueEntry }
-      | { ok: false; reason: 'state' | 'version' | 'missing' };
+      { ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'version' | 'missing' };
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
@@ -391,7 +386,11 @@ export class SqliteStore implements QueueStore {
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
-  async list(opts?: { status?: IntentStatus; account?: string; limit?: number }): Promise<QueueEntry[]> {
+  async list(opts?: {
+    status?: IntentStatus;
+    account?: string;
+    limit?: number;
+  }): Promise<QueueEntry[]> {
     const conditions: string[] = [];
     const params: unknown[] = [];
 
@@ -407,7 +406,9 @@ export class SqliteStore implements QueueStore {
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     const limit = opts?.limit !== undefined ? `LIMIT ${opts.limit}` : '';
 
-    const rows = this.db.prepare(`SELECT * FROM queue_entries ${where} ${limit}`).all(...params) as Row[];
+    const rows = this.db
+      .prepare(`SELECT * FROM queue_entries ${where} ${limit}`)
+      .all(...params) as Row[];
     return rows.map(rowToEntry);
   }
 
@@ -415,11 +416,14 @@ export class SqliteStore implements QueueStore {
   async remove(id: string, fromStates: IntentStatus[], expectedVersion: number): Promise<boolean> {
     const result = this.db.transaction(() => {
       const row = this.db.prepare('SELECT * FROM queue_entries WHERE id = ?').get(id) as
-        | Row
-        | undefined;
+        Row | undefined;
       if (row === undefined) return false;
       if (!fromStates.includes(row.status as IntentStatus)) return false;
       if (row.version !== expectedVersion) return false;
+      // Defense-in-depth beyond fromStates (parity with MemoryStore): never
+      // delete an entry whose hash may already be in flight (ADR-0011).
+      const hashes = JSON.parse(row.in_flight_hashes) as string[];
+      if (hashes.length > 0) return false;
 
       this.db.prepare('DELETE FROM queue_entries WHERE id = ?').run(id);
       return true;
@@ -432,6 +436,9 @@ export class SqliteStore implements QueueStore {
    */
   // eslint-disable-next-line @typescript-eslint/require-await
   async close(): Promise<void> {
+    // Idempotent: safe to call twice (e.g. from a test body and from afterAll).
+    if (!this.open) return;
+    this.open = false;
     this.db.close();
   }
 

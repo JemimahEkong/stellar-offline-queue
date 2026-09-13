@@ -53,27 +53,18 @@ export {
   isPreSubmission,
   isReclaimable,
 } from './state.js';
-export type { IntentStatus, TransitionTrigger, TransitionRule, TransitionResult, MinimalEntry } from './state.js';
+export type {
+  IntentStatus,
+  TransitionTrigger,
+  TransitionRule,
+  TransitionResult,
+  MinimalEntry,
+} from './state.js';
 
 // Phase 3: Storage abstraction
-export type {
-  QueueStore,
-  QueueEntry,
-  AttemptRecord,
-  CASResult,
-  CASOkResult,
-  CASFailResult,
-} from './store/types.js';
-export {
-  PayloadMismatchError,
-  EntryNotFoundError,
-  StoreError,
-} from './errors.js';
+export type { QueueStore, QueueEntry, AttemptRecord } from './store/types.js';
+export { PayloadMismatchError, EntryNotFoundError, StoreError } from './errors.js';
 
-// Phase 4: MemoryStore
+// Phase 4: Memory adapter (reference store; non-durable per architecture §15.5)
 export { MemoryStore } from './store/memory.js';
 export type { MemoryStoreOptions } from './store/memory.js';
-
-// Phase 5: SqliteStore
-export { SqliteStore } from './store/sqlite.js';
-export type { SqliteStoreOptions } from './store/sqlite.js';

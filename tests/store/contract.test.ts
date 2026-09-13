@@ -40,7 +40,10 @@ class FakeStore implements QueueStore {
     expectedVersion: number,
     workerId: string,
     leaseMs: number,
-  ): Promise<{ ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'not-due' | 'version' | 'missing' }> {
+  ): Promise<
+    | { ok: true; entry: QueueEntry }
+    | { ok: false; reason: 'state' | 'not-due' | 'version' | 'missing' }
+  > {
     const entry = this.entries.get(id);
     if (entry === undefined) return Promise.resolve({ ok: false, reason: 'missing' });
     if (!fromStates.includes(entry.status)) return Promise.resolve({ ok: false, reason: 'state' });
@@ -62,7 +65,9 @@ class FakeStore implements QueueStore {
     update: Partial<QueueEntry>,
     expectedVersion: number,
     now: number,
-  ): Promise<{ ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'version' | 'missing' }> {
+  ): Promise<
+    { ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'version' | 'missing' }
+  > {
     const entry = this.entries.get(id);
     if (entry === undefined) return Promise.resolve({ ok: false, reason: 'missing' });
     if (!fromStates.includes(entry.status)) return Promise.resolve({ ok: false, reason: 'state' });

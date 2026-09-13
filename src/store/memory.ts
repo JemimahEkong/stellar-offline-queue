@@ -1,89 +1,154 @@
 /**
- * MemoryStore: in-memory reference adapter for tests and development (Phase 4 / Issue #5).
+ * MemoryStore: in-memory reference adapter (Phase 4 / Issue #5).
  *
- * Non-durable by design — entries are lost on process exit. This is the fast,
- * deterministic substrate for all later testing (engine, ownership, retry,
- * reliability fakes). Its CAS semantics are the executable reference for what
- * SQLite must reproduce.
+ * A deterministic, correct-by-CAS `QueueStore` implementation for tests and
+ * local development. Its CAS semantics are the executable reference for what
+ * SqliteStore must reproduce (Phase 5); every mutation is serialized by an
+ * in-process async mutex so interleaved async read-modify-write sequences
+ * cannot lose updates (ADR-0003 rationale).
  *
- * Concurrency: a per-store async mutex (promise chain) serializes all mutations,
- * preventing interleaved async read-modify-write even within a single process
- * (mirrors ADR-0003 rationale).
- *
- * Clone-on-write: all entries are deep-cloned on read and write so callers
- * cannot mutate store state through references (critical for tests).
- *
- * Model contract: ADR-0003, architecture §9.2.
+ * **Non-durable by design** (architecture §15.5): all state lives in a single
+ * process; `close()` discards it. Never use this adapter where entries must
+ * survive a restart — use SqliteStore.
  */
 
-import type { QueueStore, QueueEntry } from './types.js';
 import type { IntentStatus } from '../state.js';
+import type { QueueEntry, QueueStore } from './types.js';
 
 // ---------------------------------------------------------------------------
-// Async mutex (promise-chain)
+// Options
 // ---------------------------------------------------------------------------
 
-type Mutex = {
-  <T>(fn: () => Promise<T>): Promise<T>;
+/** Constructor options for MemoryStore. */
+export type MemoryStoreOptions = {
+  /**
+   * Clock used for internal bookkeeping and exposed to tests. Inject a fixed
+   * or manually advanced clock to drive lease/backoff behaviour without real
+   * sleeps. Defaults to `Date.now`. (Note: the `QueueStore` methods still take
+   * explicit `now` arguments per architecture §9.2; this clock governs only
+   * store-internal defaults.)
+   */
+  now?: () => number;
 };
 
-function createMutex(): Mutex {
-  let head: Promise<unknown> = Promise.resolve();
-  return <T>(fn: () => Promise<T>): Promise<T> => {
-    const result = head.then(fn, fn);
-    // Always chain so subsequent calls wait for this one, but don't propagate
-    // earlier errors to later calls.
-    head = result.then(undefined, undefined);
+// ---------------------------------------------------------------------------
+// Async mutex (in-process mutation serialization)
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal promise-chain mutex: every `run` body executes only after all
+ * previously queued bodies finish, so async read-modify-write sequences
+ * (read state → validate → mutate → bump version) cannot interleave within
+ * the process. Mirrors ADR-0003's in-process safety requirement; SQLite adds
+ * cross-process safety via transactions in Phase 5.
+ */
+class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+
+  /** Queue `fn` after every previously queued operation. */
+  run<T>(fn: () => Promise<T> | T): Promise<T> {
+    const result = this.tail.then(fn);
+    // Keep the chain alive even if `fn` rejects; the caller still sees the error.
+    this.tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
     return result;
-  };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clone-on-write helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Deep-clone an entry so store state can never be mutated through a returned
+ * reference (or vice versa). `structuredClone` preserves field values exactly,
+ * including `undefined`-valued optional properties' absence semantics for our
+ * plain-JSON entry shape.
+ */
+function cloneEntry(entry: QueueEntry): QueueEntry {
+  return structuredClone(entry);
+}
+
+/**
+ * Shallow-merge an update onto an entry. Arrays are replaced wholesale —
+ * `inFlightHashes`/`attempts` updates carry the complete new array; the
+ * engine owns append logic (architecture §9.2). The embedded intent is
+ * immutable (ADR-0001) and never overwritten.
+ */
+function applyUpdate(entry: QueueEntry, update: Partial<QueueEntry>): void {
+  for (const [key, value] of Object.entries(update)) {
+    if (key === 'intent') continue;
+    (entry as Record<string, unknown>)[key] = value;
+  }
+}
+
+/**
+ * Deterministic list ordering: `intent.createdAt` ascending, ties broken by
+ * `intent.id` (lexicographic). Every listing method uses this.
+ */
+function byCreatedAtThenId(a: QueueEntry, b: QueueEntry): number {
+  return a.intent.createdAt - b.intent.createdAt || a.intent.id.localeCompare(b.intent.id);
 }
 
 // ---------------------------------------------------------------------------
 // MemoryStore
 // ---------------------------------------------------------------------------
 
-export type MemoryStoreOptions = {
-  /**
-   * Injected clock for lease/backoff tests without real sleeps.
-   * Defaults to `Date.now`.
-   */
-  now?: () => number;
-};
-
 /**
- * In-memory QueueStore adapter. Non-durable — entries are lost on process exit.
- * Suitable for tests and development only.
- *
- * Every entry is deep-cloned on read and write (clone-on-write) so callers
- * cannot mutate store state through references. All mutations are serialized
- * by an async mutex to prevent interleaved async read-modify-write.
+ * In-memory reference implementation of the `QueueStore` CAS contract
+ * (architecture §9.2). Fully deterministic: no timers, no network, no
+ * wall-clock sampling — pass explicit `now` values or inject a clock.
  */
 export class MemoryStore implements QueueStore {
   private readonly entries = new Map<string, QueueEntry>();
-  private readonly mutex: Mutex;
-  private readonly clock: () => number;
+  private readonly mutex = new AsyncMutex();
+  private readonly nowFn: () => number;
 
-  constructor(opts?: MemoryStoreOptions) {
-    this.mutex = createMutex();
-    this.clock = opts?.now ?? (() => Date.now());
+  constructor(options: MemoryStoreOptions = {}) {
+    this.nowFn = options.now ?? Date.now;
   }
 
-  async insert(entry: QueueEntry): Promise<QueueEntry> {
-    // eslint-disable-next-line @typescript-eslint/require-await
-    return this.mutex(async () => {
-      const existing = this.entries.get(entry.intent.id);
-      if (existing !== undefined) return structuredClone(existing);
-      const clone = structuredClone(entry);
-      this.entries.set(entry.intent.id, structuredClone(clone));
-      return clone;
+  /**
+   * Current store time from the injected clock. The `QueueStore` methods take
+   * explicit `now` arguments per architecture §9.2; this accessor exposes the
+   * clock itself so tests (and later modules that want the store's time base)
+   * can read it instead of sampling the wall clock.
+   */
+  now(): number {
+    return this.nowFn();
+  }
+
+  /**
+   * Discards all state (non-durable by design, architecture §15.5). Idempotent;
+   * safe to call from `afterAll` or repeatedly at shutdown.
+   */
+  async close(): Promise<void> {
+    await this.mutex.run(() => {
+      this.entries.clear();
     });
   }
 
-  // eslint-disable-next-line @typescript-eslint/require-await
+  async insert(entry: QueueEntry): Promise<QueueEntry> {
+    return this.mutex.run(() => {
+      const existing = this.entries.get(entry.intent.id);
+      if (existing !== undefined) {
+        // Idempotent insert: duplicate id returns the existing entry without
+        // mutating it (architecture §9.2 / ADR-0003).
+        return cloneEntry(existing);
+      }
+      const stored = cloneEntry(entry);
+      this.entries.set(entry.intent.id, stored);
+      return cloneEntry(stored);
+    });
+  }
+
   async get(id: string): Promise<QueueEntry | undefined> {
-    // Read-only — no mutex needed (Map.get is synchronous and atomic).
-    const entry = this.entries.get(id);
-    return entry !== undefined ? structuredClone(entry) : undefined;
+    return this.mutex.run(() => {
+      const entry = this.entries.get(id);
+      return entry !== undefined ? cloneEntry(entry) : undefined;
+    });
   }
 
   async claim(
@@ -97,20 +162,22 @@ export class MemoryStore implements QueueStore {
     | { ok: true; entry: QueueEntry }
     | { ok: false; reason: 'state' | 'not-due' | 'version' | 'missing' }
   > {
-    // eslint-disable-next-line @typescript-eslint/require-await
-    return this.mutex(async () => {
+    return this.mutex.run(() => {
       const entry = this.entries.get(id);
-      if (entry === undefined) return { ok: false, reason: 'missing' };
-      if (!fromStates.includes(entry.status)) return { ok: false, reason: 'state' };
-      if (entry.nextAttemptAt > now) return { ok: false, reason: 'not-due' };
-      if (entry.version !== expectedVersion) return { ok: false, reason: 'version' };
+      if (entry === undefined) return { ok: false as const, reason: 'missing' as const };
+      if (!fromStates.includes(entry.status))
+        return { ok: false as const, reason: 'state' as const };
+      if (entry.nextAttemptAt > now) return { ok: false as const, reason: 'not-due' as const };
+      if (entry.version !== expectedVersion) {
+        return { ok: false as const, reason: 'version' as const };
+      }
 
       entry.status = 'READY';
       entry.claimedBy = workerId;
       entry.claimExpiresAt = now + leaseMs;
-      entry.version++;
       entry.updatedAt = now;
-      return { ok: true, entry: structuredClone(entry) };
+      entry.version += 1;
+      return { ok: true as const, entry: cloneEntry(entry) };
     });
   }
 
@@ -122,86 +189,83 @@ export class MemoryStore implements QueueStore {
     expectedVersion: number,
     now: number,
   ): Promise<
-    | { ok: true; entry: QueueEntry }
-    | { ok: false; reason: 'state' | 'version' | 'missing' }
+    { ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'version' | 'missing' }
   > {
-    // eslint-disable-next-line @typescript-eslint/require-await
-    return this.mutex(async () => {
+    return this.mutex.run(() => {
       const entry = this.entries.get(id);
-      if (entry === undefined) return { ok: false, reason: 'missing' };
-      if (!fromStates.includes(entry.status)) return { ok: false, reason: 'state' };
-      if (entry.version !== expectedVersion) return { ok: false, reason: 'version' };
-
-      // Apply update: shallow merge; arrays replaced wholesale.
-      for (const [key, value] of Object.entries(update)) {
-        if (key === 'intent') continue; // never overwrite intent
-        (entry as Record<string, unknown>)[key] = value;
+      if (entry === undefined) return { ok: false as const, reason: 'missing' as const };
+      if (!fromStates.includes(entry.status))
+        return { ok: false as const, reason: 'state' as const };
+      if (entry.version !== expectedVersion) {
+        return { ok: false as const, reason: 'version' as const };
       }
+
+      applyUpdate(entry, update);
       entry.status = to;
-      entry.version++;
       entry.updatedAt = now;
-      return { ok: true, entry: structuredClone(entry) };
+      entry.version += 1;
+      return { ok: true as const, entry: cloneEntry(entry) };
     });
   }
 
-  // eslint-disable-next-line @typescript-eslint/require-await
   async listDue(fromStates: IntentStatus[], dueBefore: number): Promise<QueueEntry[]> {
-    // Read-only — no mutex needed for snapshot consistency within one process.
-    const result: QueueEntry[] = [];
-    for (const entry of this.entries.values()) {
-      if (fromStates.includes(entry.status) && entry.nextAttemptAt <= dueBefore) {
-        result.push(structuredClone(entry));
+    return this.mutex.run(() => {
+      const result: QueueEntry[] = [];
+      for (const entry of this.entries.values()) {
+        if (fromStates.includes(entry.status) && entry.nextAttemptAt <= dueBefore) {
+          result.push(cloneEntry(entry));
+        }
       }
-    }
-    result.sort(
-      (a, b) => a.intent.createdAt - b.intent.createdAt || a.intent.id.localeCompare(b.intent.id),
-    );
-    return result;
+      result.sort(byCreatedAtThenId);
+      return result;
+    });
   }
 
-  // eslint-disable-next-line @typescript-eslint/require-await
   async listByState(states: IntentStatus[]): Promise<QueueEntry[]> {
-    const result: QueueEntry[] = [];
-    for (const entry of this.entries.values()) {
-      if (states.includes(entry.status)) {
-        result.push(structuredClone(entry));
+    return this.mutex.run(() => {
+      const result: QueueEntry[] = [];
+      for (const entry of this.entries.values()) {
+        if (states.includes(entry.status)) {
+          result.push(cloneEntry(entry));
+        }
       }
-    }
-    return result;
+      result.sort(byCreatedAtThenId);
+      return result;
+    });
   }
 
-  // eslint-disable-next-line @typescript-eslint/require-await
-  async list(opts?: { status?: IntentStatus; account?: string; limit?: number }): Promise<QueueEntry[]> {
-    let result: QueueEntry[] = [...this.entries.values()].map((e) => structuredClone(e));
-    if (opts?.status !== undefined) {
-      result = result.filter((e) => e.status === opts.status);
-    }
-    if (opts?.account !== undefined) {
-      result = result.filter((e) => e.intent.sourceAccount === opts.account);
-    }
-    if (opts?.limit !== undefined) {
-      result = result.slice(0, opts.limit);
-    }
-    return result;
+  async list(opts?: {
+    status?: IntentStatus;
+    account?: string;
+    limit?: number;
+  }): Promise<QueueEntry[]> {
+    return this.mutex.run(() => {
+      let result = [...this.entries.values()];
+      if (opts?.status !== undefined) {
+        result = result.filter((e) => e.status === opts.status);
+      }
+      if (opts?.account !== undefined) {
+        result = result.filter((e) => e.intent.sourceAccount === opts.account);
+      }
+      result.sort(byCreatedAtThenId);
+      if (opts?.limit !== undefined) {
+        result = result.slice(0, opts.limit);
+      }
+      return result.map(cloneEntry);
+    });
   }
 
   async remove(id: string, fromStates: IntentStatus[], expectedVersion: number): Promise<boolean> {
-    // eslint-disable-next-line @typescript-eslint/require-await
-    return this.mutex(async () => {
+    return this.mutex.run(() => {
       const entry = this.entries.get(id);
       if (entry === undefined) return false;
       if (!fromStates.includes(entry.status)) return false;
       if (entry.version !== expectedVersion) return false;
+      // Defense-in-depth beyond fromStates: never delete an entry whose hash
+      // may already be in flight (architecture §6.5.3 / ADR-0011).
+      if (entry.inFlightHashes.length > 0) return false;
       this.entries.delete(id);
       return true;
     });
-  }
-
-  /**
-   * Return the current time from the injected clock. Useful in tests to
-   * advance time without real sleeps.
-   */
-  now(): number {
-    return this.clock();
   }
 }

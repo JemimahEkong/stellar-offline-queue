@@ -1,113 +1,94 @@
 /**
  * MemoryStore tests (Phase 4 / Issue #5).
  *
- * - Full contract suite via `runStoreContractTests`.
- * - Memory-specific: clone isolation, mutex serialization (50-way concurrent
- *   transitions), clock injection for lease/backoff.
+ * Two layers:
+ * 1. The full `runStoreContractTests` suite — MemoryStore must pass the same
+ *    contract every other adapter passes (this is the point of the suite).
+ * 2. Memory-specific tests mandated by the plan: clone isolation, mutex
+ *    serialization under concurrent mutations, injected-clock lease/not-due
+ *    behaviour without real sleeps, and deterministic ordering.
  */
 
 import { describe, it, expect } from 'vitest';
 import { MemoryStore } from '../../src/store/memory.js';
+import { isReclaimable } from '../../src/state.js';
+import { TEST_LEASE_MS, TEST_NOW, makeQueueEntry, validIntent } from '../helpers/factories.js';
 import { runStoreContractTests } from './contract.js';
-import type { QueueEntry } from '../../src/store/types.js';
-import type { Intent, CreateIntentInput } from '../../src/intent.js';
-import { createIntent } from '../../src/intent.js';
 
 // ---------------------------------------------------------------------------
-// Fixtures
+// Layer 1: full contract suite
 // ---------------------------------------------------------------------------
 
-function intentInput(overrides: Partial<CreateIntentInput> = {}): CreateIntentInput {
-  return {
-    sourceAccount: 'GAZ4BOIRV2JO5TAIKI2V4VOMYX45BW3VA3FOXGS6GGX4TY5YCFXTFPLR',
-    operations: [
-      {
-        type: 'payment',
-        destination: 'GA5BXUVTHLJXAP5M4ZZ7JIM6DYGVC4KQRXL7NQMOBRCOM5GJYKJWFQ63',
-        asset: { code: 'XLM' },
-        amount: '10.50',
-      },
-    ],
-    ...overrides,
-  };
-}
-
-function makeIntent(overrides: Partial<CreateIntentInput> = {}, now = 1_700_000_000_000): Intent {
-  return createIntent(intentInput(overrides), now);
-}
-
-function makeEntry(status: 'QUEUED' | 'READY' | 'SUBMITTING' = 'QUEUED'): QueueEntry {
-  const intent = makeIntent();
-  return {
-    intent,
-    status,
-    attemptCount: 0,
-    maxAttempts: 5,
-    nextAttemptAt: 0,
-    backoffAttempts: 0,
-    claimedBy: undefined,
-    claimExpiresAt: 0,
-    lastError: undefined,
-    inFlightHashes: [],
-    attempts: [],
-    updatedAt: 1_700_000_000_000,
-    version: 1,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Contract suite
-// ---------------------------------------------------------------------------
-
+// (No `durable` option: MemoryStore makes no persistence claim — the suite's
+// non-durable variant documents that, per architecture §15.5.)
 runStoreContractTests('MemoryStore', () => Promise.resolve(new MemoryStore()));
 
 // ---------------------------------------------------------------------------
-// Memory-specific tests
+// Layer 2: memory-specific behaviour
 // ---------------------------------------------------------------------------
 
-describe('MemoryStore — clone isolation', () => {
-  it('mutating a returned entry does not affect the store', async () => {
+describe('MemoryStore: memory-specific', () => {
+  it('clone isolation: mutating a returned entry does not affect the store', async () => {
     const store = new MemoryStore();
-    const entry = makeEntry();
-    await store.insert(entry);
+    const entry = makeQueueEntry('QUEUED');
+
+    const inserted = await store.insert(entry);
+    inserted.status = 'FAILED';
+    inserted.attemptCount = 99;
+    inserted.inFlightHashes.push('tampered');
+    inserted.intent.sourceAccount = 'G tampered';
 
     const fetched = await store.get(entry.intent.id);
     expect(fetched).toBeDefined();
-
-    // Mutate the fetched clone
-    fetched!.status = 'FAILED';
-    fetched!.attemptCount = 999;
-
-    // Original in store is unaffected
-    const refetched = await store.get(entry.intent.id);
-    expect(refetched!.status).toBe('QUEUED');
-    expect(refetched!.attemptCount).toBe(0);
-  });
-
-  it('mutating an inserted entry does not affect the store', async () => {
-    const store = new MemoryStore();
-    const entry = makeEntry();
-    const inserted = await store.insert(entry);
-
-    // Mutate the returned copy
-    inserted.status = 'SUCCESS';
-
-    // Original in store is unaffected
-    const fetched = await store.get(entry.intent.id);
     expect(fetched!.status).toBe('QUEUED');
-  });
-});
+    expect(fetched!.attemptCount).toBe(0);
+    expect(fetched!.inFlightHashes).toEqual([]);
+    expect(fetched!.intent.sourceAccount).toBe(entry.intent.sourceAccount);
 
-describe('MemoryStore — mutex serialization', () => {
-  it('50 concurrent transitions on one entry: exactly one wins per version, versions sequential', async () => {
+    // And the reverse direction: mutating the caller's own object before
+    // insert must not leak into already-stored state on re-read.
+    entry.status = 'FAILED';
+    const again = await store.get(entry.intent.id);
+    expect(again!.status).toBe('QUEUED');
+  });
+
+  it('clone isolation: mutating a claimed entry cannot mutate stored state', async () => {
     const store = new MemoryStore();
-    const entry = makeEntry('QUEUED');
+    const entry = makeQueueEntry('QUEUED');
     await store.insert(entry);
 
-    // Launch 50 concurrent transitions from QUEUED → READY (claim)
+    const claimed = await store.claim(
+      entry.intent.id,
+      ['QUEUED'],
+      TEST_NOW,
+      entry.version,
+      'worker-a',
+      TEST_LEASE_MS,
+    );
+    expect(claimed.ok).toBe(true);
+    if (!claimed.ok) return;
+
+    claimed.entry.claimedBy = 'worker-hijack';
+    claimed.entry.claimExpiresAt = 0;
+
+    const fetched = await store.get(entry.intent.id);
+    expect(fetched!.status).toBe('READY');
+    expect(fetched!.claimedBy).toBe('worker-a');
+    expect(fetched!.claimExpiresAt).toBe(TEST_NOW + TEST_LEASE_MS);
+  });
+
+  it('mutex serialization: 50 concurrent transitions produce strictly sequential versions', async () => {
+    const store = new MemoryStore();
+    const entry = makeQueueEntry('READY');
+    await store.insert(entry);
+    expect(entry.version).toBe(1);
+
+    // 50 racing transitions, all from version 1. CAS allows exactly one to
+    // win from that version; the mutex guarantees no interleaved
+    // read-modify-write silently merges them. Fire and await them all.
     const results = await Promise.all(
-      Array.from({ length: 50 }, (_, i) =>
-        store.claim(entry.intent.id, ['QUEUED'], 1_700_000_000_000, 1, `worker-${i}`, 60_000),
+      Array.from({ length: 50 }, () =>
+        store.transition(entry.intent.id, ['READY'], 'BUILDING', {}, 1, TEST_NOW),
       ),
     );
 
@@ -115,96 +96,216 @@ describe('MemoryStore — mutex serialization', () => {
     const losses = results.filter((r) => !r.ok);
     expect(wins).toHaveLength(1);
     expect(losses).toHaveLength(49);
+    for (const loss of losses) {
+      if (!loss.ok) expect(['state', 'version']).toContain(loss.reason);
+    }
 
-    // Version incremented exactly once (1 → 2)
-    const after = await store.get(entry.intent.id);
-    expect(after).toBeDefined();
-    expect(after!.version).toBe(2);
-    expect(after!.status).toBe('READY');
-    expect(after!.claimedBy).toBe('worker-0'); // first to process wins
+    const final = await store.get(entry.intent.id);
+    expect(final!.version).toBe(2);
+    expect(final!.status).toBe('BUILDING');
   });
 
-  it('sequential transitions produce strictly increasing versions', async () => {
+  it('mutex serialization: concurrent claims yield exactly one winner (50-way race)', async () => {
     const store = new MemoryStore();
-    const entry = makeEntry('QUEUED');
+    const entry = makeQueueEntry('QUEUED');
     await store.insert(entry);
 
-    // Sequential: QUEUED → READY → BUILDING → SIGNING
-    const v1 = await store.claim(entry.intent.id, ['QUEUED'], 0, 1, 'w', 60_000);
-    expect(v1.ok).toBe(true);
-    if (!v1.ok) return;
+    const results = await Promise.all(
+      Array.from({ length: 50 }, (_, i) =>
+        store.claim(
+          entry.intent.id,
+          ['QUEUED'],
+          TEST_NOW,
+          entry.version,
+          `worker-${i}`,
+          TEST_LEASE_MS,
+        ),
+      ),
+    );
 
-    const v2 = await store.transition(v1.entry.intent.id, ['READY'], 'BUILDING', {}, v2_entry_version(v1), 1);
-    expect(v2.ok).toBe(true);
-    if (!v2.ok) return;
-
-    const v3 = await store.transition(v2.entry.intent.id, ['BUILDING'], 'SIGNING', {}, v2_entry_version(v2), 2);
-    expect(v3.ok).toBe(true);
-    if (!v3.ok) return;
-
-    // Versions: 1 → 2 → 3 → 4
-    expect(v1.entry.version).toBe(2);
-    expect(v2.entry.version).toBe(3);
-    expect(v3.entry.version).toBe(4);
-  });
-});
-
-function v2_entry_version(r: { ok: true; entry: QueueEntry }): number {
-  return r.entry.version;
-}
-
-describe('MemoryStore — clock injection', () => {
-  it('clock injection drives claim not-due without sleeps', async () => {
-    let time = 1_000;
-    const store = new MemoryStore({ now: () => time });
-
-    const entry = makeEntry('QUEUED');
-    entry.nextAttemptAt = 5_000; // not due until time=5000
-    await store.insert(entry);
-
-    // Claim at time=1000 should fail (not-due)
-    const early = await store.claim(entry.intent.id, ['QUEUED'], time, 1, 'w', 60_000);
-    expect(early.ok).toBe(false);
-    if (!early.ok) expect(early.reason).toBe('not-due');
-
-    // Advance clock to 5000
-    time = 5_000;
-    const late = await store.claim(entry.intent.id, ['QUEUED'], time, 1, 'w', 60_000);
-    expect(late.ok).toBe(true);
+    const wins = results.filter((r) => r.ok);
+    expect(wins).toHaveLength(1);
+    const fetched = await store.get(entry.intent.id);
+    expect(fetched!.status).toBe('READY');
+    expect(fetched!.version).toBe(2);
   });
 
-  it('clock injection drives lease expiry without sleeps', async () => {
-    let time = 1_000;
-    const store = new MemoryStore({ now: () => time });
-
-    const entry = makeEntry('QUEUED');
+  it('clock injection: lease expiry driven without real sleeps', async () => {
+    let clock = TEST_NOW;
+    const store = new MemoryStore({ now: () => clock });
+    const entry = makeQueueEntry('QUEUED');
     await store.insert(entry);
 
-    // Claim with 60s lease
-    const claimed = await store.claim(entry.intent.id, ['QUEUED'], time, 1, 'w', 60_000);
+    const claimed = await store.claim(
+      entry.intent.id,
+      ['QUEUED'],
+      TEST_NOW,
+      entry.version,
+      'worker-a',
+      TEST_LEASE_MS,
+    );
     expect(claimed.ok).toBe(true);
     if (!claimed.ok) return;
 
-    // At time=60000 (lease not expired), entry is still READY
-    time = 60_000;
-    const before = await store.get(entry.intent.id);
-    expect(before!.status).toBe('READY');
+    // Lease still live: not reclaimable.
+    expect(claimed.entry.claimExpiresAt).toBe(TEST_NOW + TEST_LEASE_MS);
+    expect(isReclaimable(claimed.entry, clock)).toBe(false);
 
-    // At time=61001 (lease expired), entry is still READY in store
-    // (janitor reclaim is a separate transition, not automatic)
-    time = 61_001;
-    const after = await store.get(entry.intent.id);
-    expect(after!.status).toBe('READY');
-    expect(after!.claimExpiresAt).toBe(1_000 + 60_000); // original lease
+    // Advance the injected clock past the lease — no real sleep involved.
+    clock = TEST_NOW + TEST_LEASE_MS + 1;
+    expect(isReclaimable(claimed.entry, clock)).toBe(true);
+
+    // Janitor reclaim (READY → QUEUED) clears owner fields via CAS.
+    const reclaimed = await store.transition(
+      entry.intent.id,
+      ['READY'],
+      'QUEUED',
+      { claimedBy: undefined, claimExpiresAt: 0 },
+      claimed.entry.version,
+      clock,
+    );
+    expect(reclaimed.ok).toBe(true);
+    if (!reclaimed.ok) return;
+    expect(reclaimed.entry.status).toBe('QUEUED');
+    expect(reclaimed.entry.claimedBy).toBeUndefined();
+    expect(reclaimed.entry.claimExpiresAt).toBe(0);
+
+    // Entry is re-claimable by a different worker.
+    const reClaimed = await store.claim(
+      entry.intent.id,
+      ['QUEUED'],
+      clock,
+      reclaimed.entry.version,
+      'worker-b',
+      TEST_LEASE_MS,
+    );
+    expect(reClaimed.ok).toBe(true);
+    if (reClaimed.ok) expect(reClaimed.entry.claimedBy).toBe('worker-b');
   });
-});
 
-describe('MemoryStore — now() accessor', () => {
-  it('returns the current clock value', () => {
-    let time = 42;
-    const store = new MemoryStore({ now: () => time });
-    expect(store.now()).toBe(42);
-    time = 100;
-    expect(store.now()).toBe(100);
+  it('clock injection: not-due claim gating driven without real sleeps', async () => {
+    let clock = TEST_NOW;
+    const store = new MemoryStore({ now: () => clock });
+    // Backoff-scheduled entry: due at TEST_NOW + 30s.
+    const entry = makeQueueEntry('NEEDS_RETRY', { nextAttemptAt: TEST_NOW + 30_000 });
+    await store.insert(entry);
+
+    // Not due yet at the current clock time.
+    const early = await store.claim(
+      entry.intent.id,
+      ['QUEUED', 'NEEDS_RETRY'],
+      clock,
+      entry.version,
+      'worker-a',
+      TEST_LEASE_MS,
+    );
+    expect(early.ok).toBe(false);
+    if (!early.ok) expect(early.reason).toBe('not-due');
+
+    // Advance the clock past the schedule — claim now succeeds.
+    clock = TEST_NOW + 30_001;
+    const due = await store.claim(
+      entry.intent.id,
+      ['QUEUED', 'NEEDS_RETRY'],
+      clock,
+      entry.version,
+      'worker-a',
+      TEST_LEASE_MS,
+    );
+    expect(due.ok).toBe(true);
+    if (due.ok) expect(due.entry.status).toBe('READY');
+  });
+
+  it('clock injection: store.now() reflects the injected clock', () => {
+    const clock = TEST_NOW + 42;
+    const store = new MemoryStore({ now: () => clock });
+    expect(store.now()).toBe(clock);
+  });
+
+  it('deterministic ordering: listDue/listByState/list sort by createdAt then id', async () => {
+    const store = new MemoryStore();
+
+    // Same createdAt, ids deliberately inserted out of lexicographic order.
+    const later = makeQueueEntry('QUEUED', { intent: validIntent({ id: 'b-id' }, TEST_NOW) });
+    const earlier = makeQueueEntry('QUEUED', {
+      intent: validIntent({ id: 'a-id' }, TEST_NOW - 1000),
+    });
+    const tie = makeQueueEntry('QUEUED', { intent: validIntent({ id: 'a-id0' }, TEST_NOW) });
+
+    await store.insert(later);
+    await store.insert(earlier);
+    await store.insert(tie);
+
+    const expectedOrder = [earlier.intent.id, tie.intent.id, later.intent.id];
+
+    const due = await store.listDue(['QUEUED'], TEST_NOW);
+    expect(due.map((e) => e.intent.id)).toEqual(expectedOrder);
+
+    const byState = await store.listByState(['QUEUED']);
+    expect(byState.map((e) => e.intent.id)).toEqual(expectedOrder);
+
+    const all = await store.list();
+    expect(all.map((e) => e.intent.id)).toEqual(expectedOrder);
+
+    // limit slices after sorting (deterministic prefix).
+    const limited = await store.list({ limit: 2 });
+    expect(limited.map((e) => e.intent.id)).toEqual(expectedOrder.slice(0, 2));
+  });
+
+  it('list() without a sort-stable tie cannot be broken by insertion order', async () => {
+    const store = new MemoryStore();
+    // Insert identical-createdAt entries in reverse id order; output must not
+    // depend on insertion order.
+    const ids = ['c-id', 'b-id', 'a-id'];
+    for (const id of ids) {
+      await store.insert(makeQueueEntry('QUEUED', { intent: validIntent({ id }, TEST_NOW) }));
+    }
+    const all = await store.list();
+    expect(all.map((e) => e.intent.id)).toEqual(['a-id', 'b-id', 'c-id']);
+  });
+
+  it('defense-in-depth: remove refuses an in-flight entry even with permissive fromStates', async () => {
+    const store = new MemoryStore();
+    const entry = makeQueueEntry('SUBMITTING', {
+      inFlightHashes: ['a'.repeat(64)],
+    });
+    await store.insert(entry);
+
+    // Caller (incorrectly) passes SUBMITTING itself in fromStates; the store
+    // still refuses because the hash is in flight (ADR-0011).
+    const removed = await store.remove(entry.intent.id, ['SUBMITTING'], entry.version);
+    expect(removed).toBe(false);
+    const fetched = await store.get(entry.intent.id);
+    expect(fetched).toBeDefined();
+  });
+
+  it('non-durable: close() discards state (documented, architecture §15.5)', async () => {
+    const store = new MemoryStore();
+    const entry = makeQueueEntry('QUEUED');
+    await store.insert(entry);
+    await store.close();
+
+    const fetched = await store.get(entry.intent.id);
+    expect(fetched).toBeUndefined();
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('is idempotently closeable (safe in afterAll)', async () => {
+    const store = new MemoryStore();
+    await store.insert(makeQueueEntry('QUEUED'));
+    await store.close();
+    await store.close(); // must not throw
+    expect(await store.list()).toEqual([]);
+  });
+
+  it('insert rejects a corrupted duplicate the same as any duplicate: existing entry returned', async () => {
+    const store = new MemoryStore();
+    const entry = makeQueueEntry('QUEUED');
+    await store.insert(entry);
+
+    const bogus = makeQueueEntry('SUCCESS', { intent: entry.intent, version: 999 });
+    const result = await store.insert(bogus);
+    expect(result.status).toBe('QUEUED');
+    expect(result.version).toBe(1);
   });
 });

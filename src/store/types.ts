@@ -40,14 +40,20 @@ export type QueueEntry = {
   /** Consecutive transient failures driving backoff (resets on progress). */
   backoffAttempts: number;
 
-  /** Worker id holding the claim lease (§6.7); undefined when unclaimed. */
-  claimedBy?: string;
+  /**
+   * Worker id holding the claim lease (§6.7); `undefined` when unclaimed.
+   * Declared `| undefined` so janitor reclaims can clear it under
+   * `exactOptionalPropertyTypes`.
+   */
+  claimedBy?: string | undefined;
 
   /** Lease expiry (ms epoch); 0 = unclaimed. */
   claimExpiresAt: number;
 
-  /** Last error, if any (code + message + timestamp). */
-  lastError?: { code: string; message: string; ts: number };
+  /**
+   * Last error, if any. Declared `| undefined` so transitions can clear it.
+   */
+  lastError?: { code: string; message: string; ts: number } | undefined;
 
   /** Envelope hashes possibly sent to the network — write-ahead journal. */
   inFlightHashes: string[];
@@ -85,32 +91,7 @@ export type AttemptRecord = {
 
   /** Result XDR (on FAILED, for application diagnosis). */
   resultXdr?: string;
-
-  /**
-   * Flush-time parameters used to build this envelope (needed for deterministic
-   * identical rebuild across restarts — Phase 8 / ADR-0008).
-   */
-  maxTime: number;
-
-  /** Base fee used when building this envelope (string to avoid float precision). */
-  fee: string;
 };
-
-// ---------------------------------------------------------------------------
-// CAS result types
-// ---------------------------------------------------------------------------
-
-/** Result of a successful CAS operation. */
-export type CASOkResult = { ok: true; entry: QueueEntry };
-
-/** Result of a failed CAS operation. */
-export type CASFailResult = {
-  ok: false;
-  reason: 'state' | 'version' | 'missing' | 'not-due';
-};
-
-/** Union of CAS operation results. */
-export type CASResult = CASOkResult | CASFailResult;
 
 // ---------------------------------------------------------------------------
 // QueueStore interface (architecture §9.2)
@@ -152,7 +133,10 @@ export interface QueueStore {
     expectedVersion: number,
     workerId: string,
     leaseMs: number,
-  ): Promise<CASResult>;
+  ): Promise<
+    | { ok: true; entry: QueueEntry }
+    | { ok: false; reason: 'state' | 'not-due' | 'version' | 'missing' }
+  >;
 
   /**
    * CAS transition: `fromStates` must include current status and `version` must
@@ -166,7 +150,9 @@ export interface QueueStore {
     update: Partial<QueueEntry>,
     expectedVersion: number,
     now: number,
-  ): Promise<CASResult>;
+  ): Promise<
+    { ok: true; entry: QueueEntry } | { ok: false; reason: 'state' | 'version' | 'missing' }
+  >;
 
   /**
    * Scheduler scan: entries in `fromStates` with `nextAttemptAt ≤ dueBefore`,

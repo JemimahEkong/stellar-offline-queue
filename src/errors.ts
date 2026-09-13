@@ -64,7 +64,7 @@ export class StellarOfflineQueueError extends Error {
  */
 export class ValidationError extends StellarOfflineQueueError {
   /** Dotted path of the offending field, e.g. `operations[0].amount`. */
-  readonly field?: string;
+  readonly field?: string | undefined;
 
   constructor(code: ValidationErrorCode, message: string, field?: string) {
     super(code, message);
@@ -81,7 +81,7 @@ export class ValidationError extends StellarOfflineQueueError {
 export class InvalidTransitionError extends StellarOfflineQueueError {
   readonly from: string;
   readonly to: string;
-  readonly trigger?: string;
+  readonly trigger?: string | undefined;
 
   constructor(from: string, to: string, reason: string, trigger?: string) {
     super('invalid-transition', reason);

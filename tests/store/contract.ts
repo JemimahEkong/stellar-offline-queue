@@ -87,8 +87,6 @@ function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     sequenceNumber: 100,
     submittedAt: NOW,
     outcome: 'UNKNOWN',
-    maxTime: NOW + 300_000,
-    fee: '100',
     ...overrides,
   };
 }
@@ -99,11 +97,30 @@ function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
 
 export type StoreFactory = () => Promise<QueueStore & { close?(): Promise<void> }>;
 
+/** Adapter capabilities declared alongside the factory. */
+export type ContractSuiteOptions = {
+  /**
+   * Whether the adapter promises real persistence across close + reopen
+   * (SqliteStore: yes; MemoryStore: no — architecture §15.5).
+   */
+  durable?: boolean;
+  /**
+   * Required when `durable: true`: creates a fresh store instance attached to
+   * the same underlying storage (e.g. the same SQLite file) to simulate a
+   * process restart.
+   */
+  reopen?: StoreFactory;
+};
+
 /**
  * Run the full contract test suite against a store factory.
  * Each adapter's test file calls this with its own factory.
  */
-export function runStoreContractTests(name: string, makeStore: StoreFactory): void {
+export function runStoreContractTests(
+  name: string,
+  makeStore: StoreFactory,
+  opts: ContractSuiteOptions = {},
+): void {
   describe(`${name} contract suite`, () => {
     let store: QueueStore & { close?(): Promise<void> };
 
@@ -271,7 +288,14 @@ export function runStoreContractTests(name: string, makeStore: StoreFactory): vo
         const entry = makeEntry('QUEUED');
         await store.insert(entry);
 
-        const a = await store.claim(entry.intent.id, ['QUEUED'], NOW, entry.version, WORKER_A, LEASE_MS);
+        const a = await store.claim(
+          entry.intent.id,
+          ['QUEUED'],
+          NOW,
+          entry.version,
+          WORKER_A,
+          LEASE_MS,
+        );
         expect(a.ok).toBe(true);
         if (!a.ok) return;
 
@@ -300,7 +324,14 @@ export function runStoreContractTests(name: string, makeStore: StoreFactory): vo
         const entry = makeEntry('QUEUED');
         await store.insert(entry);
 
-        const claimed = await store.claim(entry.intent.id, ['QUEUED'], NOW, entry.version, WORKER_A, LEASE_MS);
+        const claimed = await store.claim(
+          entry.intent.id,
+          ['QUEUED'],
+          NOW,
+          entry.version,
+          WORKER_A,
+          LEASE_MS,
+        );
         expect(claimed.ok).toBe(true);
         if (!claimed.ok) return;
 
@@ -716,6 +747,73 @@ export function runStoreContractTests(name: string, makeStore: StoreFactory): vo
         expect(fetched!.attempts).toHaveLength(1);
         expect(fetched!.version).toBe(4);
       });
+    });
+
+    // -----------------------------------------------------------------------
+    // Restart durability (adapter-parameterized)
+    // -----------------------------------------------------------------------
+
+    describe('restart durability', () => {
+      it.runIf(opts.durable === true)(
+        'entries and state survive close + reopen (process restart simulation)',
+        async () => {
+          if (opts.reopen === undefined) {
+            throw new Error(
+              `${name}: durable: true requires a reopen() factory for the restart simulation`,
+            );
+          }
+
+          const intent = makeIntent({ id: 'restart-durability-test' });
+          const entry = makeEntry('SUBMITTING', {
+            intent,
+            attemptCount: 1,
+            claimedBy: WORKER_A,
+            claimExpiresAt: NOW + LEASE_MS,
+            inFlightHashes: ['deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef'],
+            attempts: [makeAttempt()],
+          });
+          await store.insert(entry);
+
+          // "Crash": close the store, then reopen against the same storage.
+          await store.close?.();
+          const reopened = await opts.reopen();
+
+          const fetched = await reopened.get(intent.id);
+          expect(fetched).toBeDefined();
+          expect(fetched!.status).toBe('SUBMITTING');
+          expect(fetched!.inFlightHashes).toHaveLength(1);
+          expect(fetched!.attempts).toHaveLength(1);
+          expect(fetched!.version).toBe(entry.version);
+
+          // The reopened store must be fully live: CAS still enforced.
+          const stale = await reopened.transition(
+            intent.id,
+            ['READY'],
+            'BUILDING',
+            {},
+            entry.version,
+            NOW,
+          );
+          expect(stale.ok).toBe(false);
+          if (!stale.ok) {
+            expect(stale.reason).toBe('state');
+          }
+
+          await reopened.close?.();
+          // Keep `store` usable for afterAll close (idempotent close expected).
+        },
+      );
+
+      it.runIf(opts.durable !== true)(
+        'non-durable adapter: restart durability not promised (documented, architecture §15.5)',
+        () => {
+          // MemoryStore and future ephemeral adapters intentionally lose state
+          // on close. This test documents the contract split explicitly so a
+          // durable claim can never silently regress to non-durable behavior
+          // without a failing test somewhere.
+          expect(opts.durable).toBeUndefined();
+        },
+      );
     });
   });
 }

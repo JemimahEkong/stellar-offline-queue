@@ -55,7 +55,7 @@ export type MemoConfig =
   | { type: 'return'; value: string };
 
 /** Asset reference as stored on operation configs. */
-export type AssetConfig = { code: string; issuer?: string };
+export type AssetConfig = { code: string; issuer?: string | undefined };
 
 /** `setOptions` signer entry (V1 subset: Ed25519 signer keys only). */
 export type SetOptionsSignerConfig = {
@@ -97,7 +97,7 @@ export type OperationConfig =
       sendAmount: string;
       destAsset: AssetConfig;
       destMin: string;
-      path?: AssetConfig[];
+      path?: AssetConfig[] | undefined;
     }
   | {
       type: 'pathPaymentStrictReceive';
@@ -106,12 +106,12 @@ export type OperationConfig =
       sendMax: string;
       destAsset: AssetConfig;
       destAmount: string;
-      path?: AssetConfig[];
+      path?: AssetConfig[] | undefined;
     }
   | {
       type: 'changeTrust';
       asset: AssetConfig;
-      limit?: string;
+      limit?: string | undefined;
     }
   | {
       type: 'manageSellOffer';
@@ -119,7 +119,7 @@ export type OperationConfig =
       buying: AssetConfig;
       amount: string;
       price: { n: number; d: number };
-      offerId?: string;
+      offerId?: string | undefined;
     }
   | {
       type: 'manageBuyOffer';
@@ -127,7 +127,7 @@ export type OperationConfig =
       buying: AssetConfig;
       buyAmount: string;
       price: { n: number; d: number };
-      offerId?: string;
+      offerId?: string | undefined;
     }
   | {
       type: 'setOptions';
@@ -139,12 +139,12 @@ export type OperationConfig =
 
 /** Input for `createIntent` — the immutable intent minus derived fields. */
 export type CreateIntentInput = {
-  id?: string;
+  id?: string | undefined;
   sourceAccount: string;
   operations: OperationConfig[];
-  memo?: MemoConfig;
-  timeBounds?: { maxAgeSeconds?: number };
-  metadata?: Record<string, unknown>;
+  memo?: MemoConfig | undefined;
+  timeBounds?: { maxAgeSeconds?: number | undefined };
+  metadata?: Record<string, unknown> | undefined;
 };
 
 /**
@@ -153,12 +153,12 @@ export type CreateIntentInput = {
  * `validateCreateIntentInput` returns and `createIntent` consumes.
  */
 export type NormalizedCreateIntentInput = {
-  id?: string;
+  id?: string | undefined;
   sourceAccount: string;
   operations: OperationConfig[];
-  memo?: MemoConfig;
+  memo?: MemoConfig | undefined;
   timeBounds: { maxAgeSeconds: number };
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> | undefined;
 };
 
 /** The immutable, validated, hash-protected intent (ADR-0001). */
@@ -166,26 +166,26 @@ export type Intent = {
   id: string;
   sourceAccount: string;
   operations: OperationConfig[];
-  memo?: MemoConfig;
+  memo?: MemoConfig | undefined;
   timeBounds: { maxAgeSeconds: number };
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> | undefined;
   createdAt: number;
   payloadHash: string;
 };
 
 /** Flat convenience input for `createPaymentIntent` (architecture §10). */
 export type CreatePaymentIntentInput = {
-  id?: string;
+  id?: string | undefined;
   source: string;
   destination: string;
   asset: AssetLike;
   amount: string;
-  memo?: MemoConfig;
-  metadata?: Record<string, unknown>;
+  memo?: MemoConfig | undefined;
+  metadata?: Record<string, unknown> | undefined;
 };
 
 /** Asset shorthand: native `XLM` or issued `CODE:ISSUER`. */
-export type AssetLike = string | { code: string; issuer?: string };
+export type AssetLike = string | { code: string; issuer?: string | undefined };
 
 // ---------------------------------------------------------------------------
 // Canonical JSON (T1.5)
@@ -621,7 +621,7 @@ export function validateCreateIntentInput(input: unknown): NormalizedCreateInten
 export function computePayloadHash(payload: {
   sourceAccount: string;
   operations: OperationConfig[];
-  memo?: MemoConfig;
+  memo?: MemoConfig | undefined;
   timeBounds: { maxAgeSeconds: number };
 }): string {
   const canonical = canonicalJson(payload);
