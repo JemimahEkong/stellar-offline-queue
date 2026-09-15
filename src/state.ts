@@ -179,6 +179,14 @@ export const TRANSITIONS: Readonly<
   READY: {
     QUEUED: { trigger: 'janitor-reclaim' },
     BUILDING: { trigger: 'build-started' },
+    // Deterministic failure detected after the claim (payload-mismatch,
+    // signer rejection, `tx_no_account`): BUILDING/SIGNING are transient
+    // phases that are never persisted, so the durable state at the moment of
+    // such a failure is READY — the failure row routes it to FAILED from
+    // there (implementation plan T7.2; ADR-0008 "deterministic, never
+    // automatically retried"). No side effects have occurred (no write-ahead
+    // happened), so FAILED here carries zero in-flight hashes.
+    FAILED: { trigger: 'deterministic-failure' },
   },
 
   BUILDING: {

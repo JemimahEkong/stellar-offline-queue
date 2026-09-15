@@ -134,9 +134,12 @@ describe('every valid transition', () => {
     // §6.3 rows 1–17 (ordinary transitions) + rows 18–20 (EXPIRED→QUEUED,
     // FAILED→QUEUED manual-retry escapes). Row 17 (`SUBMITTING`/`CONFIRMING`
     // → recovery sweep) is a recovery procedure, not a table row.
+    // Plus the implementation-plan T7.2 resolution: READY → FAILED via
+    // deterministic-failure (post-claim deterministic failures happen from
+    // the durable READY state, since BUILDING/SIGNING are transient).
     // This snapshot guards against accidental additions.
     // If you intentionally add a transition, update this count.
-    expect(countTransitions()).toBe(18);
+    expect(countTransitions()).toBe(19);
   });
 
   for (const [from, to] of pairs) {
@@ -225,6 +228,14 @@ describe('recovery transitions', () => {
     expect(canTransition('EXPIRED', 'QUEUED', 'manual-retry')).toEqual({ ok: true });
   });
 
+  it('READY → FAILED via deterministic-failure (plan T7.2: post-claim deterministic failures)', () => {
+    expect(canTransition('READY', 'FAILED', 'deterministic-failure')).toEqual({ ok: true });
+    // Wrong triggers rejected.
+    expect(canTransition('READY', 'FAILED', 'verdict-failed').ok).toBe(false);
+    expect(canTransition('READY', 'FAILED', 'cancel').ok).toBe(false);
+    expect(canTransition('READY', 'FAILED', 'submit-error-provable').ok).toBe(false);
+  });
+
   it('FAILED → anything-but-QUEUED is rejected', () => {
     for (const to of ALL_STATUSES) {
       if (to === 'QUEUED') continue;
@@ -250,6 +261,17 @@ describe('terminal states', () => {
     expect(canTransition('FAILED', 'READY').ok).toBe(false);
     expect(canTransition('FAILED', 'SUCCESS').ok).toBe(false);
     expect(canTransition('FAILED', 'SUBMITTING').ok).toBe(false);
+  });
+
+  it('READY has reclaim, build, and deterministic-failure rows only', () => {
+    // READY → QUEUED (janitor), READY → BUILDING (build), READY → FAILED
+    // (deterministic failure, plan T7.2). Nothing else — in particular no
+    // write-ahead from READY (that row is validated logically as
+    // SIGNING → SUBMITTING while the durable CAS runs from READY).
+    expect(canTransition('READY', 'QUEUED', 'janitor-reclaim').ok).toBe(true);
+    expect(canTransition('READY', 'BUILDING', 'build-started').ok).toBe(true);
+    expect(canTransition('READY', 'FAILED', 'deterministic-failure').ok).toBe(true);
+    expect(canTransition('READY', 'SUBMITTING', 'write-ahead').ok).toBe(false);
   });
 
   it('FAILED → QUEUED with wrong trigger is rejected', () => {

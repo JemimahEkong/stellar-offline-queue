@@ -79,3 +79,61 @@ export {
 } from './ownership.js';
 export type { ClaimParams, ClaimResult } from './ownership.js';
 export { OwnershipLostError } from './errors.js';
+
+// Phase 7: Queue processor (engine pipeline + sweep; architecture §10)
+export { OfflineQueue } from './queue.js';
+export type { OfflineQueueConfig, ProcessSummary } from './queue.js';
+export {
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_LEASE_MS,
+  DEFAULT_INTERVAL_MS,
+  RECONCILE_BATCH_LIMIT,
+  DUE_SCAN_PAGE_SIZE,
+} from './queue.js';
+export {
+  processEntry,
+  confirmEntry,
+  reconcileSubmitting,
+  verifyPayloadIntegrity,
+  transactionHash,
+} from './engine.js';
+export type {
+  EngineDeps,
+  ProcessOutcome,
+  RetryJournalRecord,
+  WorkerContext,
+} from './engine.js';
+export { buildTransaction, Networks, BASE_FEE } from './builder.js';
+export type { BuilderConfig, FlushParams } from './builder.js';
+export type { Signer, SigningContext } from './signer.js';
+export type {
+  AccountState,
+  StellarAdapter,
+  SubmitableTransaction,
+  SubmitResult,
+  SubmitStatus,
+  TxStatus,
+  TxStatusValue,
+} from './adapters/types.js';
+export { QueueEvents } from './events.js';
+export type { QueueEventType, QueueEventHandler, QueueErrorHandler } from './events.js';
+export {
+  BACKOFF_BASE_MS,
+  BACKOFF_CAP_MS,
+  computeBackoffDelay,
+  expBackoffCeiling,
+  nextAttemptTime,
+} from './backoff.js';
+export type { BackoffOptions } from './backoff.js';
+export type {
+  ReconciliationOutcome,
+  ReconciliationResult,
+} from './reconciliation.js';
+export { isRecordedOutcome } from './reconciliation.js';
+export {
+  QueueConfigError,
+  AccountNotFoundError,
+  AttemptsExhaustedError,
+  InvalidRetryStateError,
+  InvalidCancelStateError,
+} from './errors.js';

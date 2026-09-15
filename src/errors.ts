@@ -152,3 +152,105 @@ export class StoreError extends StellarOfflineQueueError {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Engine / queue errors (Phase 7 / Issue #8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by `OfflineQueue` construction when the configuration is invalid
+ * (non-positive integers, missing required members, backoff cap below base).
+ * Construction is the single validation point — a misconfigured queue never
+ * starts processing.
+ */
+export class QueueConfigError extends StellarOfflineQueueError {
+  /** Dotted config path, e.g. `backoff.capMs`. */
+  readonly field: string;
+
+  constructor(field: string, message: string) {
+    super('invalid-config', message);
+    this.name = 'QueueConfigError';
+    this.field = field;
+  }
+}
+
+/**
+ * Thrown by `adapter.loadAccount` when the source account does not exist on
+ * the network (architecture §15.1: funding is the application's job). The
+ * engine maps this to a deterministic `FAILED` (`tx_no_account`) — no retry,
+ * no submission, no side effects.
+ */
+export class AccountNotFoundError extends StellarOfflineQueueError {
+  readonly accountId: string;
+
+  constructor(accountId: string) {
+    super('account-not-found', `account state could not be loaded (account does not exist)`);
+    this.name = 'AccountNotFoundError';
+    this.accountId = accountId;
+  }
+}
+
+/**
+ * Thrown by `queue.retry(id)` when the attempt budget is spent:
+ * `attemptCount >= maxAttempts` (ADR-0008). The application may create a new
+ * intent (new id) — a deliberate, auditable act — or wait for nothing;
+ * the budget never extends.
+ */
+export class AttemptsExhaustedError extends StellarOfflineQueueError {
+  readonly intentId: string;
+  readonly attemptCount: number;
+  readonly maxAttempts: number;
+
+  constructor(intentId: string, attemptCount: number, maxAttempts: number) {
+    super(
+      'attempts-exhausted',
+      `intent "${intentId}" has exhausted its attempt budget (${attemptCount}/${maxAttempts})`,
+    );
+    this.name = 'AttemptsExhaustedError';
+    this.intentId = intentId;
+    this.attemptCount = attemptCount;
+    this.maxAttempts = maxAttempts;
+  }
+}
+
+/**
+ * Thrown by `queue.retry(id)` when the entry is in a state manual retry is
+ * not allowed from (ADR-0008: SUCCESS, INDETERMINATE, SUBMITTING, CONFIRMING,
+ * QUEUED, NEEDS_RETRY, READY). Also thrown when a raced `retry()` finds the
+ * entry already re-queued — explicit over silent.
+ */
+export class InvalidRetryStateError extends StellarOfflineQueueError {
+  readonly intentId: string;
+  readonly currentStatus: string;
+
+  constructor(intentId: string, currentStatus: string) {
+    super(
+      'invalid-retry-state',
+      `intent "${intentId}" is ${currentStatus}; manual retry is only allowed from FAILED or EXPIRED`,
+    );
+    this.name = 'InvalidRetryStateError';
+    this.intentId = intentId;
+    this.currentStatus = currentStatus;
+  }
+}
+
+/**
+ * Thrown by `queue.cancel(id)` when the entry is not in a pre-submission
+ * cancellable state (ADR-0011: only QUEUED/NEEDS_RETRY may be cancelled;
+ * anything with an in-flight hash or a terminal state is rejected without
+ * mutation).
+ */
+export class InvalidCancelStateError extends StellarOfflineQueueError {
+  readonly intentId: string;
+  readonly currentStatus: string;
+
+  constructor(intentId: string, currentStatus: string) {
+    super(
+      'invalid-cancel-state',
+      `intent "${intentId}" is ${currentStatus}; cancel is only allowed from QUEUED or NEEDS_RETRY`,
+    );
+    this.name = 'InvalidCancelStateError';
+    this.intentId = intentId;
+    this.currentStatus = currentStatus;
+  }
+}
