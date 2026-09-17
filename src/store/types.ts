@@ -75,13 +75,37 @@ export type QueueEntry = {
 /**
  * Audit record for one build cycle (one envelope). Created at the write-ahead
  * transition; one AttemptRecord per envelope submitted.
+ *
+ * Phase 8 (ADR-0008): the record also carries the flush parameters the
+ * envelope was built from (`sequenceNumber`, `maxTime`, `fee`), so a
+ * post-restart resume can rebuild the **byte-identical** envelope
+ * deterministically — build is a pure function of (intent, sequence, fee,
+ * maxTime) — and assert the rebuilt hash equals the journaled hash before
+ * resubmitting (`envelope-drift` failure otherwise). Signatures are never
+ * persisted; only these build parameters are.
  */
 export type AttemptRecord = {
   /** Envelope hash (hex) — dedupe key, journaled before submit. */
   envelopeHash: string;
 
-  /** Sequence number used in this envelope (audit only, never authoritative). */
-  sequenceNumber: number;
+  /**
+   * Sequence number used in this envelope (decimal string, 64-bit safe).
+   * Authoritative for identical rebuilds: the resume path rebuilds with this
+   * exact sequence and asserts hash equality before resubmitting.
+   */
+  sequenceNumber: string;
+
+  /**
+   * `maxTime` (unix seconds) of this envelope's time bounds — the second
+   * deterministic build parameter (flush time resolved at build, §6.6).
+   */
+  maxTime: number;
+
+  /**
+   * Per-operation fee (stroops string) used in this envelope — the third
+   * deterministic build parameter.
+   */
+  fee: string;
 
   /** When the envelope was submitted (ms epoch). */
   submittedAt: number;

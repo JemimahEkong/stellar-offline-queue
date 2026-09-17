@@ -25,11 +25,23 @@
  *
  * Submission classification (§8.2): PENDING/DUPLICATE/UNKNOWN → CONFIRMING;
  * TRY_AGAIN_LATER / transport errors / TIMEOUT → NEEDS_RETRY (backoff;
- * identical envelope on in-worker resume — the signed envelope is held only
- * in memory for this worker, per §8.1 Case 3, so after a restart the entry
- * is reconciled, never rebuilt); ERROR `tx_bad_auth`/`tx_malformed`
- * (structural) → FAILED; ERROR `tx_too_late` → CONFIRMING → EXPIRED; all
- * other ERRORs → CONFIRMING ("when in doubt, poll the hash").
+ * identical envelope on resume — see below); ERROR `tx_bad_auth`/
+ * `tx_malformed` (structural) → FAILED; ERROR `tx_too_late` → CONFIRMING →
+ * EXPIRED; all other ERRORs → CONFIRMING ("when in doubt, poll the hash").
+ *
+ * Identical-envelope resume (ADR-0008, Phase 8): the signed envelope is held
+ * in memory for in-worker resume; the AttemptRecord additionally journals
+ * the deterministic build parameters (`sequenceNumber`, `maxTime`, `fee`),
+ * so a **post-restart** resume rebuilds the byte-identical envelope via
+ * `buildDeterministic`, re-signs, and asserts the rebuilt hash equals the
+ * journaled hash **before** submitting (`envelope-drift` → FAILED if it
+ * does not). No signatures are ever persisted.
+ *
+ * Backoff progress rule (§6.6): `backoffAttempts` resets on any
+ * **non-transient** progress — SUBMITTING→CONFIRMING (submit-ack),
+ * CONFIRMING→verdict, NEEDS_RETRY→SUBMITTING (resume write-ahead), and
+ * rebuild/manual-retry → QUEUED — and increments only on
+ * SUBMITTING→NEEDS_RETRY transient failures.
  */
 
 import type { QueueStore, QueueEntry, AttemptRecord } from './store/types.js';
@@ -37,7 +49,13 @@ import type { IntentStatus, TransitionTrigger } from './state.js';
 import { validateTransition } from './state.js';
 import type { QueueEvents } from './events.js';
 import { claimEntry, refreshLease, type ClaimResult } from './ownership.js';
-import { buildTransaction, type BuilderConfig, type FlushParams } from './builder.js';
+import {
+  buildDeterministic,
+  buildTransaction,
+  type BuilderConfig,
+  type BuildParams,
+  type FlushParams,
+} from './builder.js';
 import type { Signer } from './signer.js';
 import type { StellarAdapter, SubmitResult, TxStatus } from './adapters/types.js';
 import { computePayloadHash } from './intent.js';
@@ -142,6 +160,13 @@ async function cas(
   now: number,
 ): Promise<QueueEntry> {
   validateTransition(current.status, to, trigger);
+
+  // Backoff progress rule (§6.6): every persisted move other than the
+  // transient-failure row is non-transient progress — reset the consecutive
+  // failure counter (the scheduleRetry row sets its own value explicitly).
+  if (trigger !== 'transient-failure' && update.backoffAttempts === undefined && current.backoffAttempts !== 0) {
+    update.backoffAttempts = 0;
+  }
 
   const result = await deps.store.transition(
     current.intent.id,
@@ -258,15 +283,19 @@ export async function processEntry(
   }
 
   // NEEDS_RETRY claimed but this worker holds no signed envelope (process
-  // restart): the entry is reconciled, never rebuilt (§8.1 Case 3). Leave it
-  // for the recovery sweep (Phase 13/14 complete the resume rule).
+  // restart): rebuild the **byte-identical** envelope deterministically from
+  // the journaled AttemptRecord parameters (ADR-0008, T8.3) and re-sign it.
+  // Build is a pure function of (intent, sequence, fee, maxTime) — all three
+  // journaled — so the rebuilt envelope hash must equal the journaled hash;
+  // drift is a tamper/corruption signal and fails the entry without submit.
   //
   // Distinguish it from a *rebuilt* entry (EXPIRED → QUEUED via rebuild/
-  // manual-retry, or a manual retry from FAILED): those legitimately carry
-  // prior attempts from the earlier cycle. The durable record marks a rebuild
-  // by clearing lastError — a fresh QUEUED entry has none.
+  // manual-retry, or a manual retry from FAILED): those legitimately start a
+  // fresh cycle with a NEW envelope and no in-flight hashes. The durable
+  // record marks a rebuild by clearing lastError — a fresh QUEUED entry has
+  // none.
   if (candidate.status === 'NEEDS_RETRY' && entry.lastError !== undefined) {
-    return { kind: 'pending', status: 'NEEDS_RETRY' };
+    return resumeViaRebuild(deps, entry, now);
   }
 
   // -- 1. Payload integrity (§9.4, defense in depth post-claim) -----------
@@ -374,13 +403,25 @@ export async function processEntry(
   // Logical validation of the write-ahead row (§6.3 row 6); the durable CAS
   // runs from READY because transient phases are never persisted.
   validateTransition('SIGNING', 'SUBMITTING', 'write-ahead');
+  // Deterministic build parameters (ADR-0008): journaled on the AttemptRecord
+  // so a post-restart resume can rebuild this byte-identical envelope. The
+  // per-op fee is the builder config's baseFee (tx.fee is the total).
+  const buildParams: BuildParams = {
+    sequence: tx.sequence,
+    fee: deps.builderConfig.baseFee,
+    maxTime:
+      tx.timeBounds !== undefined
+        ? Number(tx.timeBounds.maxTime)
+        : Math.floor(now / 1000) + entry.intent.timeBounds.maxAgeSeconds,
+  };
   const attempt: AttemptRecord = {
     envelopeHash,
-    // Audit only (never authoritative); taken from the built envelope.
-    // `number` per the frozen AttemptRecord shape — sequences beyond
-    // 2^53 lose precision here, which is acceptable for the audit copy
-    // (the authoritative datum is the envelope hash).
-    sequenceNumber: Number(tx.sequence),
+    // Authoritative for identical rebuilds across restarts (decimal string,
+    // 64-bit safe — sequences exceed Number.MAX_SAFE_INTEGER on mature
+    // accounts).
+    sequenceNumber: buildParams.sequence,
+    maxTime: buildParams.maxTime,
+    fee: buildParams.fee,
     submittedAt: now,
     outcome: 'UNKNOWN',
   };
@@ -553,6 +594,118 @@ async function scheduleRetry(
  * pure state move (hash and AttemptRecord already journaled — no duplicate
  * record, no attemptCount increment), then submit + classify as usual.
  */
+/**
+ * Post-restart identical-envelope resume (ADR-0008, T8.3): the worker holds
+ * no signed envelope (its process died), so rebuild the envelope
+ * deterministically from the journaled AttemptRecord parameters
+ * (`sequenceNumber`, `maxTime`, `fee`), re-sign, and assert the rebuilt hash
+ * equals the journaled hash **before** submitting.
+ *
+ * The envelope is the identity: the network dedupes by hash, so a
+ * byte-identical resubmission can never double-apply. A hash mismatch
+ * (`envelope-drift`) means the stored intent no longer produces the journaled
+ * envelope (tampering or a build-rule change) — the entry fails without
+ * submitting; the journaled hash stays unresolved for reconciliation.
+ */
+async function resumeViaRebuild(
+  deps: EngineDeps,
+  entry: QueueEntry,
+  now: number,
+): Promise<ProcessOutcome> {
+  const last = entry.attempts[entry.attempts.length - 1];
+  const lastHash = lastInFlightHash(entry);
+  if (
+    last === undefined ||
+    lastHash === undefined ||
+    last.envelopeHash !== lastHash ||
+    last.outcome !== 'UNKNOWN'
+  ) {
+    throw new OwnershipLostError(
+      entry.intent.id,
+      entry.claimedBy ?? 'unknown-worker',
+      'NEEDS_RETRY entry lacks a consistent unresolved attempt record',
+    );
+  }
+
+  let rebuilt: Transaction;
+  try {
+    const params: BuildParams = {
+      sequence: last.sequenceNumber,
+      fee: last.fee,
+      maxTime: last.maxTime,
+    };
+    rebuilt = buildDeterministic(entry.intent, params, deps.builderConfig);
+  } catch (error: unknown) {
+    // Deterministic build failure → FAILED, no submission (§6.3 row 17).
+    await failEntry(deps, entry, 'build-failed', (error as Error).message, now);
+    return { kind: 'settled', status: 'FAILED' };
+  }
+
+  // Envelope identity check (ADR-0008): the rebuild must be byte-identical.
+  const rebuiltHash = transactionHash(rebuilt);
+  if (rebuiltHash !== lastHash) {
+    await failEntry(deps, entry, 'envelope-drift', 'rebuilt envelope hash does not match the journaled hash', now);
+    return { kind: 'settled', status: 'FAILED' };
+  }
+
+  // Re-sign the identical envelope. Signing does not change the hash
+  // (Stellar hashes exclude signatures); the journal already carries it.
+  let signed: Transaction;
+  try {
+    signed = await deps.signer.sign(rebuilt, {
+      intentId: entry.intent.id,
+      networkPassphrase: deps.builderConfig.networkPassphrase,
+    });
+  } catch {
+    await failEntry(deps, entry, 'signer-rejected', 'the application signer rejected the transaction', now);
+    return { kind: 'settled', status: 'FAILED' };
+  }
+  if (signed.networkPassphrase !== deps.builderConfig.networkPassphrase) {
+    await failEntry(deps, entry, 'signer-malformed', 'signed envelope is for a different network', now);
+    return { kind: 'settled', status: 'FAILED' };
+  }
+  if (transactionHash(signed) !== lastHash) {
+    // Signing must not alter the transaction body (§11.2); treat any drift
+    // as malformed — the journaled hash would no longer identify the
+    // envelope being submitted.
+    await failEntry(deps, entry, 'signer-malformed', 'signed envelope hash diverged from the journaled hash', now);
+    return { kind: 'settled', status: 'FAILED' };
+  }
+
+  // The resume write-ahead: READY → SUBMITTING. Pure state move — the hash
+  // and AttemptRecord are already journaled (no new record, no attemptCount
+  // increment; identical-envelope resubmissions are not build cycles).
+  await refreshLease(deps.store, entry.intent.id, entry.claimedBy ?? '', deps.leaseMs, now);
+  const owned = await deps.store.get(entry.intent.id);
+  if (owned === undefined) {
+    throw new OwnershipLostError(entry.intent.id, entry.claimedBy ?? 'unknown-worker', 'entry removed before resume write-ahead');
+  }
+  validateTransition('SIGNING', 'SUBMITTING', 'write-ahead');
+  const writeAhead = await deps.store.transition(
+    entry.intent.id,
+    ['READY'],
+    'SUBMITTING',
+    { claimExpiresAt: now + deps.leaseMs, backoffAttempts: 0 },
+    owned.version,
+    now,
+  );
+  if (!writeAhead.ok) {
+    throw new OwnershipLostError(entry.intent.id, entry.claimedBy ?? 'unknown-worker', `resume write-ahead CAS failed (${writeAhead.reason})`);
+  }
+  deps.events.emit('intent:transition', writeAhead.entry);
+
+  // Journal the freshly signed envelope for any in-worker resumption too.
+  deps.retryJournal.set(entry.intent.id, { tx: signed, envelopeHash: lastHash });
+
+  let submitResult: SubmitResult;
+  try {
+    submitResult = await deps.adapter.submitTransaction(signed);
+  } catch (error: unknown) {
+    return scheduleRetry(deps, writeAhead.entry, now, `submit transport error: ${(error as Error).message}`);
+  }
+  return classifySubmitResult(deps, writeAhead.entry, signed, submitResult, now);
+}
+
 async function resumeSubmit(
   deps: EngineDeps,
   entry: QueueEntry,
@@ -579,7 +732,7 @@ async function resumeSubmit(
     entry.intent.id,
     ['READY'],
     'SUBMITTING',
-    { claimExpiresAt: now + deps.leaseMs },
+    { claimExpiresAt: now + deps.leaseMs, backoffAttempts: 0 },
     owned.version,
     now,
   );

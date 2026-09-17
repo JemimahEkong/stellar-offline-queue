@@ -58,6 +58,21 @@ export type FlushParams = {
   flushTime: number;
 };
 
+/**
+ * The complete deterministic build parameters of one envelope (ADR-0008):
+ * build is a pure function of `(intent, sequence, fee, maxTime)`, so these
+ * three values — all journaled on the `AttemptRecord` — are everything the
+ * post-restart resume path needs to rebuild the **byte-identical** envelope.
+ */
+export type BuildParams = {
+  /** Sequence number to embed (decimal string; typically `account.seq + 1`). */
+  sequence: string;
+  /** Per-operation fee in stroops (decimal string). */
+  fee: string;
+  /** Upper time bound in unix **seconds** (resolved at the original flush). */
+  maxTime: number;
+};
+
 // ---------------------------------------------------------------------------
 // SDK conversion helpers (internal)
 // ---------------------------------------------------------------------------
@@ -164,40 +179,46 @@ function toSdkOperation(op: OperationConfig): ReturnType<(typeof Operation)['pay
 // ---------------------------------------------------------------------------
 
 /**
- * Build the unsigned transaction for one attempt (architecture §4.4):
+ * Build the unsigned transaction from **explicit deterministic parameters**
+ * (ADR-0008 identical-envelope rule): `config.networkPassphrase` supplies the
+ * network; `params.fee` overrides `config.baseFee`. Build is pure — no clock
+ * reads, no I/O — so fixed inputs yield byte-identical XDR (hence the same
+ * envelope hash).
  *
- * - source = `intent.sourceAccount`, sequence = `accountState.sequence + 1`
- *   (via SDK `Account`, which consumes the sequence on build);
- * - fee = `config.baseFee` per operation;
- * - `maxTime = flushTime + maxAgeSeconds` (relative bounds resolved at
- *   flush time, ADR-0005); `minTime = 0`;
- * - memo and operations mapped 1:1 from the intent.
- *
- * Throws `ValidationError` when an SDK build-time rule rejects the payload
- * (the intent itself was validated at enqueue; SDK rules are the second
- * net). The engine maps any build throw to a deterministic failure.
+ * Throws `ValidationError` when an SDK build-time rule rejects the payload.
  */
-export function buildTransaction(
+export function buildDeterministic(
   intent: Intent,
-  accountState: AccountState,
-  config: BuilderConfig,
-  params: FlushParams,
+  params: BuildParams,
+  config: Pick<BuilderConfig, 'networkPassphrase'>,
 ): Transaction {
   if (!Number.isInteger(intent.timeBounds.maxAgeSeconds) || intent.timeBounds.maxAgeSeconds <= 0) {
     throw new ValidationError('invalid-time-bounds', 'intent.timeBounds.maxAgeSeconds must be a positive integer', 'timeBounds.maxAgeSeconds');
   }
-  if (!/^[0-9]+$/.test(accountState.sequence)) {
-    throw new ValidationError('invalid-amount', 'accountState.sequence must be a decimal string', 'sequence');
+  if (!/^[0-9]+$/.test(params.sequence)) {
+    throw new ValidationError('invalid-amount', 'sequence must be a decimal string', 'sequence');
+  }
+  // The SDK `Account` consumes its sequence on build (tx sequence =
+  // account.sequence + 1), so the account is constructed one BELOW the
+  // requested transaction sequence. A transaction sequence of 0 can never
+  // exist (accounts start at 0; the first transaction is 1).
+  if (BigInt(params.sequence) <= 0n) {
+    throw new ValidationError('invalid-amount', 'sequence must be a positive integer (transaction sequences start at 1)', 'sequence');
+  }
+  if (!/^[0-9]+$/.test(params.fee)) {
+    throw new ValidationError('invalid-amount', 'fee must be a non-negative integer string (stroops)', 'fee');
+  }
+  if (!Number.isInteger(params.maxTime) || params.maxTime < 0) {
+    throw new ValidationError('invalid-time-bounds', 'maxTime must be a non-negative integer (unix seconds)', 'maxTime');
   }
 
-  const sdkAccount = new Account(intent.sourceAccount, accountState.sequence);
+  const sdkAccount = new Account(intent.sourceAccount, (BigInt(params.sequence) - 1n).toString());
   const builder = new TransactionBuilder(sdkAccount, {
-    fee: config.baseFee,
+    fee: params.fee,
     networkPassphrase: config.networkPassphrase,
     timebounds: {
       minTime: 0,
-      // SDK timebounds are unix SECONDS; flushTime is ms epoch.
-      maxTime: Math.floor(params.flushTime / 1000) + intent.timeBounds.maxAgeSeconds,
+      maxTime: params.maxTime,
     },
   });
 
@@ -209,4 +230,38 @@ export function buildTransaction(
   }
 
   return builder.build();
+}
+
+/**
+ * Build the unsigned transaction for one attempt (architecture §4.4):
+ *
+ * - source = `intent.sourceAccount`, sequence = `accountState.sequence + 1`
+ *   (via SDK `Account`, which consumes the sequence on build);
+ * - fee = `config.baseFee` per operation;
+ * - `maxTime = flushTime + maxAgeSeconds` (relative bounds resolved at
+ *   flush time, ADR-0005); `minTime = 0`;
+ * - memo and operations mapped 1:1 from the intent.
+ *
+ * Deterministic core: delegates to `buildDeterministic` with the flush-time
+ * parameters, so this path and the post-restart identical-rebuild path share
+ * one code base and cannot drift.
+ *
+ * Throws `ValidationError` when an SDK build-time rule rejects the payload
+ * (the intent itself was validated at enqueue; SDK rules are the second
+ * net). The engine maps any build throw to a deterministic failure.
+ */
+export function buildTransaction(
+  intent: Intent,
+  accountState: AccountState,
+  config: BuilderConfig,
+  params: FlushParams,
+): Transaction {
+  if (!/^[0-9]+$/.test(accountState.sequence)) {
+    throw new ValidationError('invalid-amount', 'accountState.sequence must be a decimal string', 'sequence');
+  }
+  // Sequence arithmetic must be string-safe: sequence numbers are int64 and
+  // exceed Number.MAX_SAFE_INTEGER for mature accounts.
+  const sequence = (BigInt(accountState.sequence) + 1n).toString();
+  const maxTime = Math.floor(params.flushTime / 1000) + intent.timeBounds.maxAgeSeconds;
+  return buildDeterministic(intent, { sequence, fee: config.baseFee, maxTime }, config);
 }

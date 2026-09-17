@@ -87,7 +87,7 @@ describe('happy path', () => {
     expect(confirming.inFlightHashes).toHaveLength(1);
     expect(confirming.attempts).toHaveLength(1);
     expect(confirming.attempts[0]!.outcome).toBe('UNKNOWN');
-    expect(confirming.attempts[0]!.sequenceNumber).toBe(101); // account.seq + 1
+    expect(confirming.attempts[0]!.sequenceNumber).toBe('101'); // account.seq + 1
 
     // Verdict poll → SUCCESS.
     adapter.statusFor(confirming.inFlightHashes[0]!, txSuccess());
@@ -502,7 +502,7 @@ describe('ownership + recovery invariants', () => {
       inFlightHashes: [hash],
       attemptCount: 1,
       attempts: [
-        { envelopeHash: hash, sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: hash, sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });
@@ -529,7 +529,7 @@ describe('ownership + recovery invariants', () => {
     const crashed = makeQueueEntry('SUBMITTING', {
       inFlightHashes: [hash],
       attempts: [
-        { envelopeHash: hash, sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: hash, sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });
@@ -551,7 +551,7 @@ describe('ownership + recovery invariants', () => {
     const confirming = makeQueueEntry('CONFIRMING', {
       inFlightHashes: [hash],
       attempts: [
-        { envelopeHash: hash, sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: hash, sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });
@@ -574,7 +574,7 @@ describe('ownership + recovery invariants', () => {
     const confirming = makeQueueEntry('CONFIRMING', {
       inFlightHashes: [hash],
       attempts: [
-        { envelopeHash: hash, sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: hash, sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });

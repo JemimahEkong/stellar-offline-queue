@@ -222,7 +222,7 @@ describe('per-account single-writer (§6.7 layer 3)', () => {
       inFlightHashes: ['a'.repeat(64)],
       attemptCount: 1,
       attempts: [
-        { envelopeHash: 'a'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: 'a'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: { code: 'transient-error', message: 'stalled', ts: TEST_NOW },
     });
@@ -281,7 +281,7 @@ describe('process() concurrency', () => {
       inFlightHashes: ['c'.repeat(64)],
       attemptCount: 1,
       attempts: [
-        { envelopeHash: 'c'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: 'c'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });
@@ -336,7 +336,7 @@ describe('recovery of EXPIRED (rebuild) entries', () => {
       attemptCount: 1,
       maxAttempts: 5,
       attempts: [
-        { envelopeHash: 'e'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'EXPIRED' },
+        { envelopeHash: 'e'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'EXPIRED' },
       ],
       lastError: undefined,
     });
@@ -358,7 +358,7 @@ describe('recovery of EXPIRED (rebuild) entries', () => {
       maxAttempts: 5,
       inFlightHashes: [],
       attempts: [
-        { envelopeHash: 'f'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'EXPIRED' },
+        { envelopeHash: 'f'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'EXPIRED' },
       ],
       lastError: undefined,
     });
@@ -534,7 +534,7 @@ describe('reconcile()', () => {
     const confirming = makeQueueEntry('CONFIRMING', {
       inFlightHashes: ['d'.repeat(64)],
       attempts: [
-        { envelopeHash: 'd'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: 'd'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });
@@ -551,7 +551,7 @@ describe('reconcile()', () => {
     const confirming = makeQueueEntry('CONFIRMING', {
       inFlightHashes: ['e'.repeat(64)],
       attempts: [
-        { envelopeHash: 'e'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: 'e'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });
@@ -589,7 +589,7 @@ describe('events + start()/stop()', () => {
     const confirming = makeQueueEntry('CONFIRMING', {
       inFlightHashes: ['f'.repeat(64)],
       attempts: [
-        { envelopeHash: 'f'.repeat(64), sequenceNumber: 101, submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
+        { envelopeHash: 'f'.repeat(64), sequenceNumber: '101', maxTime: TEST_NOW + 300, fee: '100', submittedAt: TEST_NOW, outcome: 'UNKNOWN' },
       ],
       lastError: undefined,
     });

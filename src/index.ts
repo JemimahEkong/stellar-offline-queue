@@ -103,8 +103,8 @@ export type {
   RetryJournalRecord,
   WorkerContext,
 } from './engine.js';
-export { buildTransaction, Networks, BASE_FEE } from './builder.js';
-export type { BuilderConfig, FlushParams } from './builder.js';
+export { buildTransaction, buildDeterministic, Networks, BASE_FEE } from './builder.js';
+export type { BuilderConfig, FlushParams, BuildParams } from './builder.js';
 export type { Signer, SigningContext } from './signer.js';
 export type {
   AccountState,

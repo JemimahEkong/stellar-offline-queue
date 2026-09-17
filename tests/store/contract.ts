@@ -84,7 +84,9 @@ function makeEntry(
 function makeAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     envelopeHash: randomUUID().replace(/-/g, '').slice(0, 64),
-    sequenceNumber: 100,
+    sequenceNumber: '100',
+    maxTime: NOW + 300,
+    fee: '100',
     submittedAt: NOW,
     outcome: 'UNKNOWN',
     ...overrides,

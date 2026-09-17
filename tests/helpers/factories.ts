@@ -63,7 +63,9 @@ export function fakeEnvelopeHash(): string {
 export function makeAttemptRecord(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     envelopeHash: fakeEnvelopeHash(),
-    sequenceNumber: 100,
+    sequenceNumber: '100',
+    maxTime: 1_700_000_300,
+    fee: '100',
     submittedAt: TEST_NOW,
     outcome: 'UNKNOWN',
     ...overrides,
