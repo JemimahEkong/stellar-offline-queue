@@ -4,11 +4,11 @@ Offline-first transaction workflow and reliability layer for Stellar application
 
 ## Status
 
-**Design and planning phase complete; implementation has not started.**
+**Design complete; implementation underway (V1 phases 0–8 / issues #1–#9 merged).**
 
 - Architecture, V1 scope, and decision records: see [`docs/architecture.md`](docs/architecture.md), [`docs/v1-scope.md`](docs/v1-scope.md), and [`docs/decisions/`](docs/decisions/).
 - Execution plan: [`docs/implementation.md`](docs/implementation.md) (24 phases, 0–23) with the issue breakdown in [`docs/github-issues.md`](docs/github-issues.md).
-- This repository currently contains the approved documentation set, the repository foundation (toolchain, CI, source/test structure), the core domain model (`src/intent.ts` — Issue #2), the lifecycle state machine (`src/state.ts` — Issue #3), the storage contract (`src/store/types.ts` + the shared adapter contract suite — Issue #4), and the reference adapter `MemoryStore` (`src/store/memory.ts` — Issue #5). `MemoryStore` is a deterministic, in-process adapter for tests and local development and is **non-durable by design**: all state is discarded on `close()`; use `SqliteStore` (Issue #6, pending) wherever entries must survive a restart. Remaining `src/` modules are stubs pending their implementation issues.
+- This repository currently contains the approved documentation set, the repository foundation (toolchain, CI, source/test structure), the core domain model (`src/intent.ts` — Issue #2), the lifecycle state machine (`src/state.ts` — Issue #3), the storage contract (`src/store/types.ts` + the shared adapter contract suite — Issue #4), the storage adapters `MemoryStore` (`src/store/memory.ts` — Issue #5) and `SqliteStore` (`src/store/sqlite.ts` — Issue #6), processing ownership (`src/ownership.ts` — Issue #7), the engine pipeline and sweep (`src/engine.ts` + `src/queue.ts` — Issue #8), and the retry/attempt model with deterministic identical-envelope rebuilds (`src/builder.ts`, Issue #9). `MemoryStore` is a deterministic, in-process adapter for tests and local development and is **non-durable by design**: all state is discarded on `close()`; use `SqliteStore` wherever entries must survive a restart. Remaining `src/` modules are stubs pending their implementation issues.
 
 ## Planned V1 capabilities (design approved; not yet implemented)
 
@@ -37,7 +37,11 @@ CI runs install → typecheck → lint → test → build on Node 22 and Node 24
 
 ## Contributing
 
-Issues map 1:1 to the implementation plan: one issue → one `feature/<issue#>-<slug>` branch → PR → review → CI → merge. Work is not merged to `main` without passing CI and review; experimental work stays on branches. See [`CONTRIBUTING.md`](CONTRIBUTING.md) (arriving with the documentation issue) and the engineering rules in [`docs/implementation.md`](docs/implementation.md). Security-relevant reports: see [`SECURITY.md`](SECURITY.md) (arriving with the documentation issue).
+Issues map 1:1 to the implementation plan: one issue → one `feature/<issue#>-<slug>` branch → PR → review → CI → merge. Work is not merged to `main` without passing CI and review; experimental work stays on branches. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full guide, and the engineering rules in [`docs/implementation.md`](docs/implementation.md).
+
+## Security
+
+Security-relevant reports are handled privately — never open a public issue for a suspected vulnerability. See [SECURITY.md](./SECURITY.md) for the disclosure policy and scope.
 
 ## License
 
